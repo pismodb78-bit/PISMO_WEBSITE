@@ -5,7 +5,8 @@ const jwt = require('jsonwebtoken');
 const db = require('../db');
 const authGuard = require('../middleware/auth');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'pismo_secret_blurple_key_2026';
+// ВАЖНО: секрет совпадает с JwtAuth.cs в десктопном клиенте
+const JWT_SECRET = process.env.JWT_SECRET || 'uc5KT2e+qYwa6tb0HUXnLZwsC55VuB93szkSpkucr8i1BFjKA6RXbyIrjk0+ign9';
 
 // POST /api/auth/register
 router.post('/register', async (req, res) => {
@@ -16,17 +17,14 @@ router.post('/register', async (req, res) => {
     }
 
     try {
-        // Проверка на уникальность логина
         const [existingUsers] = await db.query('SELECT id FROM users WHERE login = ?', [login]);
         if (existingUsers.length > 0) {
             return res.status(400).json({ message: 'Пользователь с таким логином уже зарегистрирован' });
         }
 
-        // Хешируем новый пароль для веб-версии
         const hashedPassword = await bcrypt.hash(password, 10);
         const userRole = role || 'student';
 
-        // Важно: Поля Name и Surname пишем с большой буквы, как в схеме MySQL!
         await db.query(
             'INSERT INTO users (login, password, Name, Surname, role) VALUES (?, ?, ?, ?, ?)',
             [login, hashedPassword, name || null, surname || null, userRole]
@@ -55,20 +53,27 @@ router.post('/login', async (req, res) => {
 
         const user = users[0];
 
-        // Проверяем пароль (совместимость с bcrypt + легаси plain text)
+        // Проверяем bcrypt-пароль (веб) и plain text (легаси десктоп WinForms)
         let isMatch = await bcrypt.compare(password, user.password).catch(() => false);
-        
         if (!isMatch && password === user.password) {
-            isMatch = true; // Фолбек для старой базы данных WinForms
+            isMatch = true; // Фолбек для старых записей из десктопа
         }
 
         if (!isMatch) {
             return res.status(400).json({ message: 'Неверный логин или пароль' });
         }
 
-        // Генерация токена на 24 часа
+        const now = Math.floor(Date.now() / 1000);
+
+        // Payload совместим с JwtAuth.cs: uid, login, iat, exp
         const token = jwt.sign(
-            { id: user.id, login: user.login, role: user.role },
+            {
+                uid: user.id,       // десктоп использует "uid", не "id"
+                id: user.id,        // оставляем "id" для совместимости с нашим middleware
+                login: user.login,
+                role: user.role,
+                iat: now,
+            },
             JWT_SECRET,
             { expiresIn: '24h' }
         );
@@ -91,14 +96,13 @@ router.post('/login', async (req, res) => {
 
 // POST /api/auth/logout
 router.post('/logout', (req, res) => {
-    // В JWT-архитектуре инвалидация происходит на стороне клиента удалением токена
     return res.json({ message: 'Успешный выход из системы' });
 });
 
 // POST /api/auth/change-password
 router.post('/change-password', authGuard, async (req, res) => {
     const { oldPassword, newPassword } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.id || req.user.uid;
 
     if (!oldPassword || !newPassword) {
         return res.status(400).json({ message: 'Необходимо указать старый и новый пароли' });
@@ -112,7 +116,6 @@ router.post('/change-password', authGuard, async (req, res) => {
 
         const currentPasswordHash = users[0].password;
         let isMatch = await bcrypt.compare(oldPassword, currentPasswordHash).catch(() => false);
-        
         if (!isMatch && oldPassword === currentPasswordHash) {
             isMatch = true;
         }
@@ -131,21 +134,14 @@ router.post('/change-password', authGuard, async (req, res) => {
     }
 });
 
-/**
- * @route   GET /api/auth/users
- * @desc    Получить список всех пользователей мессенджера для сайдбара
- * @access  Private (нужен валидный JWT токен)
- */
+// GET /api/auth/users — список пользователей для сайдбара
 router.get('/users', authGuard, async (req, res) => {
     try {
-        // Запрашиваем только безопасные поля, исключая пароли
         const [users] = await db.query('SELECT id, login, Name, Surname, role FROM users');
         return res.json(users);
     } catch (err) {
         console.error('[Ошибка получения списка пользователей]:', err);
-        return res.status(500).json({ 
-            message: 'Внутренняя ошибка сервера при получении списка пользователей' 
-        });
+        return res.status(500).json({ message: 'Внутренняя ошибка сервера при получении списка пользователей' });
     }
 });
 

@@ -1,9 +1,11 @@
 const jwt = require('jsonwebtoken');
-const JWT_SECRET = process.env.JWT_SECRET || 'pismo_secret_blurple_key_2026';
+
+// ВАЖНО: секрет совпадает с JwtAuth.cs в десктопном клиенте
+const JWT_SECRET = process.env.JWT_SECRET || 'uc5KT2e+qYwa6tb0HUXnLZwsC55VuB93szkSpkucr8i1BFjKA6RXbyIrjk0+ign9';
 
 module.exports = function (req, res, next) {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // Ожидаем формат "Bearer <token>"
+    const token = authHeader && authHeader.split(' ')[1]; // Формат: "Bearer <token>"
 
     if (!token) {
         return res.status(401).json({ message: 'Доступ запрещен. Токен авторизации отсутствует.' });
@@ -11,7 +13,7 @@ module.exports = function (req, res, next) {
 
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = decoded; // Передаем id, login и role в объект запроса
+        req.user = decoded; // Передаём id, login и role в объект запроса
         next();
     } catch (err) {
         return res.status(403).json({ message: 'Невалидный или просроченный токен сессии.' });
