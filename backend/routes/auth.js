@@ -8,6 +8,30 @@ const authGuard = require('../middleware/auth');
 // ВАЖНО: секрет совпадает с JwtAuth.cs в десктопном клиенте
 const JWT_SECRET = process.env.JWT_SECRET || 'uc5KT2e+qYwa6tb0HUXnLZwsC55VuB93szkSpkucr8i1BFjKA6RXbyIrjk0+ign9';
 
+// Превращаем ошибку БД в понятный для клиента ответ (вместо общего "внутренняя ошибка").
+// Возвращает true, если ответ уже отправлен.
+function handleDbError(res, err) {
+    const code = err && err.code;
+
+    // Соединение с MySQL не установлено: сервер БД выключен, недоступен по сети,
+    // неверный host/port, или пул вообще не инициализирован (db === undefined).
+    if (
+        err instanceof TypeError ||
+        ['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EHOSTUNREACH', 'PROTOCOL_CONNECTION_LOST', 'ER_CON_COUNT_ERROR'].includes(code)
+    ) {
+        res.status(503).json({ message: 'Сервер базы данных недоступен. Проверьте, что MySQL запущен и доступен.' });
+        return true;
+    }
+
+    // Подключение есть, но БД отвергла доступ: неверный логин/пароль/имя БД в ip.txt.
+    if (['ER_ACCESS_DENIED_ERROR', 'ER_DBACCESS_DENIED_ERROR', 'ER_BAD_DB_ERROR'].includes(code)) {
+        res.status(500).json({ message: 'Ошибка доступа к базе данных. Проверьте логин/пароль/имя БД в ip.txt.' });
+        return true;
+    }
+
+    return false;
+}
+
 // POST /api/auth/register
 router.post('/register', async (req, res) => {
     const { login, password, name, surname, role } = req.body;
@@ -33,6 +57,7 @@ router.post('/register', async (req, res) => {
         return res.status(201).json({ message: 'Регистрация успешно завершена' });
     } catch (err) {
         console.error('[Ошибка регистрации]:', err);
+        if (handleDbError(res, err)) return;
         return res.status(500).json({ message: 'Внутренняя ошибка сервера при регистрации' });
     }
 });
@@ -90,6 +115,7 @@ router.post('/login', async (req, res) => {
         });
     } catch (err) {
         console.error('[Ошибка авторизации]:', err);
+        if (handleDbError(res, err)) return;
         return res.status(500).json({ message: 'Внутренняя ошибка сервера при авторизации' });
     }
 });

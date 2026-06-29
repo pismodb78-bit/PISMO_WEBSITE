@@ -3,6 +3,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const db = require('./db');
 const authRoutes = require('./routes/auth');
 
 const app = express();
@@ -53,4 +54,14 @@ server.listen(PORT, () => {
     console.log(`==================================================`);
     console.log(`🚀 Сервер PISMO Web успешно запущен на порту ${PORT}`);
     console.log(`==================================================`);
+
+    // Проверка соединения с БД при старте — чтобы сразу видеть проблему,
+    // а не ловить непонятную "внутреннюю ошибку" на каждом входе в систему.
+    db.query('SELECT 1')
+        .then(() => console.log('[БД] Соединение с базой данных установлено ✅'))
+        .catch((e) => {
+            console.error('[БД] НЕ УДАЛОСЬ подключиться к базе данных ❌');
+            console.error(`     Причина: ${e.code || e.message}`);
+            console.error('     Проверь: запущен ли MySQL, доступен ли host:port из ip.txt, верны ли логин/пароль/имя БД.');
+        });
 });
