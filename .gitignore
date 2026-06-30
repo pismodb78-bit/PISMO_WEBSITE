@@ -1,3 +1,7 @@
+.vs/
+
 node_modules/
 
-.txt
+.env
+
+ip.txt

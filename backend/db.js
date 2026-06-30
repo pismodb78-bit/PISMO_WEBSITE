@@ -31,12 +31,12 @@ try {
     // Создание пула подключений к MySQL
     pool = mysql.createPool({
         host: config.server,
-        port: parseInt(config.port) || 3306,
+        port: parseInt(config.port) || 3307,
         user: config.uid,
         password: config.password,
         database: config.database,
         waitForConnections: true,
-        connectionLimit: 15,
+        connectionLimit: 10,
         queueLimit: 0,
         enableKeepAlive: true,
         keepAliveInitialDelay: 10000

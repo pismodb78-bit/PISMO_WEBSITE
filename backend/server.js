@@ -1,56 +1,57 @@
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const authRoutes = require('./routes/auth');
+const socketAuth = require('./socket/auth');
 
 const app = express();
 const server = http.createServer(app);
 
-// Интеграция Socket.IO с гибким CORS-доступом
 const io = new Server(server, {
     cors: {
-        origin: '*', // На этапе разработки разрешаем все запросы
-        methods: ['GET', 'POST', 'PUT', 'DELETE']
-    }
+        origin: (origin, callback) => {
+            // На этапе разработки разрешаем любой origin, но ОТРАЖАЕМ его явно,
+            // а не возвращаем '*' — это обязательно при credentials: true на клиенте
+            callback(null, origin);
+        },
+        methods: ['GET', 'POST', 'PUT', 'DELETE'],
+        credentials: true
+    },
+    maxHttpBufferSize: 60 * 1024 * 1024
 });
 
-// Глобальные Middleware
-app.use(cors());
+app.use(cors({
+    origin: (origin, callback) => callback(null, origin),
+    credentials: true
+}));
 app.use(express.json());
 
-// Подключение роутеров приложения
+// Только авторизация остаётся на REST. Все чаты, файлы, группы — через сокеты.
 app.use('/api/auth', authRoutes);
-app.use('/api/messages', require('./routes/messages'));
-app.use('/api/groups', require('./routes/groups'));
-app.use('/api', require('./routes/notify'));
 
-
-
-// Тестовый эндпоинт проверки жизнеспособности сервера
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'active', build: 'PISMO-Web-v1.0' });
+    res.json({ status: 'active', build: 'PISMO-Web-v2.0-WS' });
 });
 
-// Логика Socket.IO — вся обработка событий ('join', 'chat:join', 'message:new' и т.д.)
-// находится ТОЛЬКО внутри socket/chat.js, чтобы не было дублей и расхождений.
+// Аутентификация сокета по JWT на этапе handshake — единственное место проверки токена
+io.use(socketAuth);
+
 io.on('connection', (socket) => {
-    console.log(`[Socket] Новое подключение: ${socket.id}`);
+    console.log(`[Socket] Подключен user_${socket.userId} (${socket.id})`);
 
     require('./socket/chat')(io, socket);
 
     socket.on('disconnect', () => {
-        console.log(`[Socket] Соединение разорвано: ${socket.id}`);
+        console.log(`[Socket] Отключен user_${socket.userId} (${socket.id})`);
     });
 });
 
-// Делаем инстанс io доступным внутри других файлов проекта (например, в роутах сообщений)
 global.io = io;
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
     console.log(`==================================================`);
-    console.log(`🚀 Сервер PISMO Web успешно запущен на порту ${PORT}`);
+    console.log(`🚀 Сервер PISMO Web (WebSocket-only) запущен на порту ${PORT}`);
     console.log(`==================================================`);
 });
