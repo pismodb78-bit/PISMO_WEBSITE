@@ -124,6 +124,13 @@ router.post('/change-password', authGuard, async (req, res) => {
             return res.status(400).json({ message: 'Старый пароль указан неверно' });
         }
 
+        // Новый пароль не должен совпадать со старым (учитываем и bcrypt, и legacy plain text)
+        let sameAsOld = await bcrypt.compare(newPassword, currentPasswordHash).catch(() => false);
+        if (!sameAsOld && newPassword === currentPasswordHash) sameAsOld = true;
+        if (newPassword === oldPassword || sameAsOld) {
+            return res.status(400).json({ message: 'Новый пароль совпадает со старым' });
+        }
+
         const hashedNewPassword = await bcrypt.hash(newPassword, 10);
         await db.query('UPDATE users SET password = ? WHERE id = ?', [hashedNewPassword, userId]);
 
