@@ -245,29 +245,62 @@ const ChatWindow = ({ activeChat, user, socket }) => {
   const handleCancelFile = () => { setSelectedFile(null); fileInputRef.current.value = ''; };
 
   const startRecording = async () => {
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') return;
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+      alert('Микрофон недоступен в этом браузере');
+      return;
+    }
+    if (!window.MediaRecorder) {
+      alert('Запись не поддерживается этим браузером');
+      return;
+    }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorderRef.current = new window.MediaRecorder(stream);
+      // Уважаем выбранный в настройках устройств микрофон, если он есть.
+      const savedMicId = localStorage.getItem('pismo_mic_device_id');
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: savedMicId ? { deviceId: { exact: savedMicId } } : true
+      });
+
+      // Выбираем контейнер, который браузер реально поддерживает (Chrome/FF — webm/opus,
+      // Safari — mp4). Раньше жёстко ставили audio/webm, из-за чего в некоторых браузерах
+      // запись/воспроизведение ломались.
+      const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+      const chosenMime = preferred.find(t => window.MediaRecorder.isTypeSupported(t)) || '';
+      mediaRecorderRef.current = chosenMime
+        ? new window.MediaRecorder(stream, { mimeType: chosenMime })
+        : new window.MediaRecorder(stream);
+
       audioChunksRef.current = [];
-      mediaRecorderRef.current.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+      mediaRecorderRef.current.ondataavailable = (e) => { if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data); };
       mediaRecorderRef.current.onstop = async () => {
-        const audioFile = new File([new Blob(audioChunksRef.current)], 'voice_msg.webm', { type: 'audio/webm' });
-        const formData = new FormData();
-        formData.append('file', audioFile);
-
-        const url = activeChat.isGroup
-          ? `/groups/${activeChat.id}/messages`
-          : '/messages';
-        if (!activeChat.isGroup) formData.append('receiverId', activeChat.id);
-
-        const response = await api.post(url, formData);
-
-        setMessages((prev) => prev.some(m => m.id === response.data.id) ? prev : [...prev, response.data]);
-        // Не шлём socket.emit('message:new', ...) здесь — сервер уже
-        // рассылает событие всем участникам через global.io сразу после записи в БД.
-        // Повторная отправка с фронта создавала бы дубликат у получателя.
+        // Останавливаем микрофон в любом случае (даже если дальше выйдем по ошибке).
         stream.getTracks().forEach(track => track.stop());
+        try {
+          // Тип берём с самого рекордера — он точно знает, в каком контейнере писал.
+          const actualType = mediaRecorderRef.current?.mimeType || chosenMime || 'audio/webm';
+          const blob = new Blob(audioChunksRef.current, { type: actualType });
+
+          if (blob.size === 0) {
+            alert('Запись пустая — микрофон не дал звук');
+            return;
+          }
+
+          const ext = actualType.includes('ogg') ? 'ogg' : actualType.includes('mp4') ? 'm4a' : 'webm';
+          const audioFile = new File([blob], `voice_msg.${ext}`, { type: actualType });
+          const formData = new FormData();
+          formData.append('file', audioFile);
+
+          const url = activeChat.isGroup
+            ? `/groups/${activeChat.id}/messages`
+            : '/messages';
+          if (!activeChat.isGroup) formData.append('receiverId', activeChat.id);
+
+          const response = await api.post(url, formData);
+          // Дедуп по id: сервер также разошлёт message:new/group:message:new отправителю.
+          setMessages((prev) => prev.some(m => m.id === response.data.id) ? prev : [...prev, response.data]);
+        } catch (err) {
+          console.error('Ошибка отправки голосового:', err);
+          alert('Не удалось отправить голосовое сообщение');
+        }
       };
       mediaRecorderRef.current.start();
       setIsRecording(true);

@@ -29,7 +29,7 @@ router.post('/', authMiddleware, upload.single('file'), async (req, res) => {
       if (mimeType.startsWith('image/')) {
         msg_type = 'image';
         image_data = req.file.buffer;
-      } else if (mimeType.startsWith('audio/') || file_name.endsWith('.webm')) {
+      } else if (mimeType.startsWith('audio/') || /\.(webm|ogg|wav|mp3|m4a)$/i.test(file_name)) {
         msg_type = 'audio';
         audio_data = req.file.buffer;
       } else {
@@ -56,6 +56,13 @@ router.post('/', authMiddleware, upload.single('file'), async (req, res) => {
 
     const [newMessageRows] = await db.execute('SELECT * FROM messages WHERE id = ?', [result.insertId]);
     const savedMessage = newMessageRows[0];
+
+    // Диагностика голосовых: сравниваем размер полученного буфера и того, что реально
+    // легло в БД. Если "в БД" заметно меньше "получено" — колонку audio_data режет тип
+    // (обычный BLOB = 64 КБ); тогда нужно ALTER TABLE ... MODIFY audio_data LONGBLOB.
+    if (msg_type === 'audio') {
+      console.log(`[Голосовое] id=${savedMessage.id} ${sender_id}→${receiverId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${savedMessage.audio_data ? savedMessage.audio_data.length : 0} Б (mime=${req.file && req.file.mimetype}, file=${file_name})`);
+    }
 
     if (savedMessage.image_data) savedMessage.image_data = savedMessage.image_data.toString('base64');
     if (savedMessage.audio_data) savedMessage.audio_data = savedMessage.audio_data.toString('base64');

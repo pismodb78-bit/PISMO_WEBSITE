@@ -193,6 +193,12 @@ router.post('/:groupId/messages', authMiddleware, upload.single('file'), async (
     const [rows] = await db.execute('SELECT * FROM group_messages WHERE id = ?', [result.insertId]);
     const saved = rows[0];
 
+    // Диагностика голосовых в группе: получено vs реально сохранено в БД
+    // (если "в БД" меньше — колонку audio_data режет BLOB, нужен LONGBLOB).
+    if (msg_type === 'audio') {
+      console.log(`[Голосовое-группа] id=${saved.id} группа=${groupId} от=${sender_id}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${saved.audio_data ? saved.audio_data.length : 0} Б (mime=${req.file && req.file.mimetype}, file=${file_name})`);
+    }
+
     // Тип сообщения для фронта — определяем по наличию данных, как и при чтении истории
     saved.msg_type = msg_type;
     if (saved.image_data) saved.image_data = saved.image_data.toString('base64');
