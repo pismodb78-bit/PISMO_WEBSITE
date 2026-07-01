@@ -208,6 +208,11 @@ module.exports = (io, socket) => {
             );
 
             const [rows] = await db.execute('SELECT * FROM messages WHERE id = ?', [result.insertId]);
+            // Диагностика голосовых: получено vs реально в БД. Если "в БД" меньше —
+            // колонку audio_data режет обычный BLOB (64 КБ), нужен LONGBLOB.
+            if (msg_type === 'audio') {
+                console.log(`[Голосовое] id=${rows[0].id} ${userId}→${receiverId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
+            }
             const saved = toBase64(rows[0]);
 
             io.to(`chat_${receiverId}`).to(`chat_${userId}`).emit('message:new', saved);
@@ -428,6 +433,9 @@ module.exports = (io, socket) => {
             );
 
             const [rows] = await db.execute('SELECT * FROM group_messages WHERE id = ?', [result.insertId]);
+            if (msg_type === 'audio') {
+                console.log(`[Голосовое-группа] id=${rows[0].id} группа=${groupId} от=${userId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
+            }
             const saved = toBase64(rows[0]);
             saved.msg_type = msg_type;
 

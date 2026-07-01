@@ -33,10 +33,17 @@ const DeviceSettingsModal = ({ onClose }) => {
   // поэтому до первого "Тест" пункты могут называться "Camera 1" / "Microphone 1" и т.п.
   useEffect(() => {
     async function loadDevices() {
+      // Браузер отдаёт устройства с нормальными label только ПОСЛЕ выданного разрешения.
+      // Поэтому сначала запрашиваем доступ (probe-поток), затем перечисляем, затем глушим probe.
       try {
+        const probe = await navigator.mediaDevices.getUserMedia({ audio: true, video: true })
+          .catch(() => navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null));
+
         const devices = await navigator.mediaDevices.enumerateDevices();
         setCameras(devices.filter(d => d.kind === 'videoinput'));
         setMics(devices.filter(d => d.kind === 'audioinput'));
+
+        if (probe) probe.getTracks().forEach(t => t.stop());
       } catch (err) {
         console.error('Не удалось получить список устройств:', err);
       }

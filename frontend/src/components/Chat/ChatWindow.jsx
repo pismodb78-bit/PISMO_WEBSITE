@@ -138,6 +138,10 @@ const ChatWindow = ({ activeChat, user, socket }) => {
     const [isRecording, setIsRecording] = useState(false);
     const [editingMsgId, setEditingMsgId] = useState(null);
     const [editText, setEditText] = useState('');
+    // Счётчик "сброса кеша": входит в key каждого LazyMedia. Инкремент заставляет
+    // React перемонтировать медиа-компоненты и заново запросить файлы с сервера
+    // (иначе при том же key={msg.id} useEffect по msg.id не срабатывает и висят старые данные).
+    const [cacheBust, setCacheBust] = useState(0);
 
     const messagesEndRef = useRef(null);
     const fileInputRef = useRef(null);
@@ -249,6 +253,7 @@ const ChatWindow = ({ activeChat, user, socket }) => {
 
     useEffect(() => {
         const handleClearCache = () => {
+            setCacheBust((c) => c + 1); // форсируем перемонтирование LazyMedia
             fetchMessages();
         };
         window.addEventListener('pismo:clear-media-cache', handleClearCache);
@@ -290,16 +295,43 @@ const ChatWindow = ({ activeChat, user, socket }) => {
     const handleCancelFile = () => { setSelectedFile(null); fileInputRef.current.value = ''; };
 
     const startRecording = async () => {
-        if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') return;
+        if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+            alert('Микрофон недоступен в этом браузере');
+            return;
+        }
+        if (!window.MediaRecorder) {
+            alert('Запись не поддерживается этим браузером');
+            return;
+        }
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaRecorderRef.current = new window.MediaRecorder(stream);
-            audioChunksRef.current = [];
-            mediaRecorderRef.current.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
-            mediaRecorderRef.current.onstop = async () => {
-                const audioFile = new File([new Blob(audioChunksRef.current)], 'voice_msg.webm', { type: 'audio/webm' });
+            // Учитываем выбранный в настройках устройств микрофон, если он есть.
+            const savedMicId = localStorage.getItem('pismo_mic_device_id');
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: savedMicId ? { deviceId: { exact: savedMicId } } : true
+            });
 
+            // Берём контейнер, который браузер реально поддерживает (Chrome/FF — webm/opus,
+            // Safari — mp4). Жёсткий audio/webm ломал запись/воспроизведение в части браузеров.
+            const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+            const chosenMime = preferred.find(t => window.MediaRecorder.isTypeSupported(t)) || '';
+            mediaRecorderRef.current = chosenMime
+                ? new window.MediaRecorder(stream, { mimeType: chosenMime })
+                : new window.MediaRecorder(stream);
+
+            audioChunksRef.current = [];
+            mediaRecorderRef.current.ondataavailable = (e) => { if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data); };
+            mediaRecorderRef.current.onstop = async () => {
+                stream.getTracks().forEach(track => track.stop());
                 try {
+                    const actualType = mediaRecorderRef.current?.mimeType || chosenMime || 'audio/webm';
+                    const blob = new Blob(audioChunksRef.current, { type: actualType });
+                    if (blob.size === 0) {
+                        alert('Запись пустая — микрофон не дал звук');
+                        return;
+                    }
+                    const ext = actualType.includes('ogg') ? 'ogg' : actualType.includes('mp4') ? 'm4a' : 'webm';
+                    const audioFile = new File([blob], `voice_msg.${ext}`, { type: actualType });
+
                     const filePayload = await fileToPayload(audioFile);
                     const event = activeChat.isGroup ? 'group:send' : 'chat:send';
                     const payload = activeChat.isGroup
@@ -314,8 +346,6 @@ const ChatWindow = ({ activeChat, user, socket }) => {
                 } catch (err) {
                     console.error('Ошибка отправки голосового сообщения:', err);
                     alert('Не удалось отправить голосовое сообщение');
-                } finally {
-                    stream.getTracks().forEach(track => track.stop());
                 }
             };
             mediaRecorderRef.current.start();
@@ -355,6 +385,7 @@ const ChatWindow = ({ activeChat, user, socket }) => {
         header: { height: '60px', backgroundColor: 'var(--bg-primary)', display: 'flex', alignItems: 'center', padding: '0 20px', borderBottom: '1px solid rgba(0,0,0,0.3)' },
         headerTitle: { color: '#fff', fontSize: '16px', fontWeight: '600' },
         messagesArea: { flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' },
+        emptyState: { margin: 'auto', color: 'var(--text-muted)', fontSize: '15px', textAlign: 'center', maxWidth: '360px', lineHeight: '1.5' },
         messageRow: { display: 'flex', alignItems: 'flex-start' },
         avatar: { width: '40px', height: '40px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 'bold', marginRight: '16px', flexShrink: 0 },
         msgContent: { display: 'flex', flexDirection: 'column', maxWidth: '70%' },
@@ -379,6 +410,13 @@ const ChatWindow = ({ activeChat, user, socket }) => {
                 </div>
             </div>
             <div style={styles.messagesArea}>
+                {messages.length === 0 && (
+                    <div style={styles.emptyState}>
+                        {activeChat.isGroup
+                            ? `В группе «${activeChat.Name}» пока нет сообщений. Напишите первым!`
+                            : `Напишите ${activeChat.Name || activeChat.login}, чтобы начать общение`}
+                    </div>
+                )}
                 {messages.map((msg) => {
                     const isMe = Number(msg.sender_id) === Number(user.id);
 
@@ -419,7 +457,7 @@ const ChatWindow = ({ activeChat, user, socket }) => {
                                     <>
                                         {msg.text && <div style={styles.msgText}>{msg.text}</div>}
                                         {msg.msg_type !== 'text' && (
-                                            <LazyMedia msg={msg} isGroup={activeChat.isGroup} />
+                                            <LazyMedia key={`${msg.id}_${cacheBust}`} msg={msg} isGroup={activeChat.isGroup} />
                                         )}
                                     </>
                                 )}
