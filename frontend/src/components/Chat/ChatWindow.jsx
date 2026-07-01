@@ -263,7 +263,7 @@ const ChatWindow = ({ activeChat, user, socket }) => {
 
         const response = await api.post(url, formData);
 
-        setMessages((prev) => [...prev, response.data]);
+        setMessages((prev) => prev.some(m => m.id === response.data.id) ? prev : [...prev, response.data]);
         // Не шлём socket.emit('message:new', ...) здесь — сервер уже
         // рассылает событие всем участникам через global.io сразу после записи в БД.
         // Повторная отправка с фронта создавала бы дубликат у получателя.
@@ -312,6 +312,7 @@ const ChatWindow = ({ activeChat, user, socket }) => {
     header: { height: '60px', backgroundColor: 'var(--bg-primary)', display: 'flex', alignItems: 'center', padding: '0 20px', borderBottom: '1px solid rgba(0,0,0,0.3)' },
     headerTitle: { color: '#fff', fontSize: '16px', fontWeight: '600' },
     messagesArea: { flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' },
+    emptyState: { margin: 'auto', color: 'var(--text-muted)', fontSize: '15px', textAlign: 'center', maxWidth: '360px', lineHeight: '1.5' },
     messageRow: { display: 'flex', alignItems: 'flex-start' },
     avatar: { width: '40px', height: '40px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 'bold', marginRight: '16px', flexShrink: 0 },
     msgContent: { display: 'flex', flexDirection: 'column', maxWidth: '70%' },
@@ -339,6 +340,13 @@ const ChatWindow = ({ activeChat, user, socket }) => {
         </div>
       </div>
       <div style={styles.messagesArea}>
+        {messages.length === 0 && (
+          <div style={styles.emptyState}>
+            {activeChat.isGroup
+              ? `В группе «${activeChat.Name}» пока нет сообщений. Напишите первым!`
+              : `Напишите ${activeChat.Name || activeChat.login}, чтобы начать общение`}
+          </div>
+        )}
         {messages.map((msg) => {
           const isMe = Number(msg.sender_id) === Number(user.id);
 
