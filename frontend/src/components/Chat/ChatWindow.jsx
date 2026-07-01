@@ -246,6 +246,7 @@ const ChatWindow = ({ activeChat, user, socket }) => {
 
     useEffect(() => {
         const handleClearCache = () => {
+            setCacheBust((c) => c + 1); // форсируем перемонтирование LazyMedia
             fetchMessages();
         };
         window.addEventListener('pismo:clear-media-cache', handleClearCache);
