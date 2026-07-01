@@ -1,4 +1,5 @@
 const db = require('../db');
+const { encrypt, decrypt } = require('./crypto');
 
 function toBase64(msg) {
     if (msg.image_data) msg.image_data = msg.image_data.toString('base64');
@@ -33,6 +34,12 @@ function toHistoryPreview(msg) {
     return msg;
 }
 
+// Расшифровывает текст сообщения перед отправкой клиенту
+function decryptMsg(msg) {
+    if (msg.text) msg.text = decrypt(msg.text);
+    return msg;
+}
+
 // Раскладывает входящий base64-файл по нужной колонке (раньше это делал multer)
 function splitIncomingFile(file) {
     let image_data = null, audio_data = null, file_data = null, file_name = null, msg_type = 'text';
@@ -40,10 +47,13 @@ function splitIncomingFile(file) {
     if (file && file.data) {
         const buffer = Buffer.from(file.data, 'base64');
         file_name = file.name || null;
-        const mime = file.mime || '';
+        const mime = (file.mime || '').toLowerCase();
         const lowerName = (file_name || '').toLowerCase();
 
-        if (mime.startsWith('image/')) {
+        if (mime.startsWith('image/') || /\.(jpe?g|png|gif|webp|bmp)$/i.test(lowerName)) {
+            // Иногда браузер не проставляет mime у файла (file.type === '') — тогда
+            // картинка ошибочно уходила как «файл» и рендерилась блоком 📄 с GUID-именем
+            // поверх изображения. Подстраховываемся распознаванием по расширению.
             msg_type = 'image';
             image_data = buffer;
         } else if (
@@ -125,7 +135,7 @@ module.exports = (io, socket) => {
             const [rows] = await db.execute(query, params);
 
             const result = rows.map(r => {
-                let preview = r.lastMessage || '';
+                let preview = r.lastMessage ? decrypt(r.lastMessage) : '';
                 let type = r.lastMsgType;
                 if (r.lastHasImage) type = 'image';
                 else if (r.lastHasAudio) type = 'audio';
@@ -162,6 +172,7 @@ module.exports = (io, socket) => {
             const history = rows.map(m => {
                 const detected = detectMsgType(m);
                 m.msg_type = detected !== 'text' ? detected : (m.msg_type || 'text');
+                decryptMsg(m);
                 return toHistoryPreview(m);
             });
 
@@ -200,15 +211,24 @@ module.exports = (io, socket) => {
     socket.on('chat:send', async ({ receiverId, text, file }, cb) => {
         try {
             const { image_data, audio_data, file_data, file_name, msg_type } = splitIncomingFile(file);
+            const encryptedText = (text && msg_type === 'text') ? encrypt(text) : (text || null);
 
             const [result] = await db.execute(
                 `INSERT INTO messages (sender_id, receiver_id, text, image_data, audio_data, file_data, file_name, msg_type)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [userId, receiverId, text || null, image_data, audio_data, file_data, file_name, msg_type]
+                [userId, receiverId, encryptedText, image_data, audio_data, file_data, file_name, msg_type]
             );
 
             const [rows] = await db.execute('SELECT * FROM messages WHERE id = ?', [result.insertId]);
+
+            // Диагностика голосовых: получено vs реально в БД.
+            if (msg_type === 'audio') {
+                console.log(`[Голосовое] id=${rows[0].id} ${userId}→${receiverId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
+            }
+
             const saved = toBase64(rows[0]);
+            // расшифровываем перед отправкой клиентам
+            saved.text = decrypt(saved.text);
 
             io.to(`chat_${receiverId}`).to(`chat_${userId}`).emit('message:new', saved);
 
@@ -236,9 +256,10 @@ module.exports = (io, socket) => {
 
     socket.on('chat:edit', async ({ chatId, msgId, text }, cb) => {
         try {
+            const encryptedText = encrypt(text);
             const [result] = await db.execute(
                 'UPDATE messages SET text = ? WHERE id = ? AND sender_id = ?',
-                [text, msgId, userId]
+                [encryptedText, msgId, userId]
             );
             if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
 
@@ -278,22 +299,38 @@ module.exports = (io, socket) => {
 
     socket.on('groups:list', async (_payload, cb) => {
         try {
+            // Используем надежный рабочий запрос с MAX(id) из первого файла
             const query = `
         SELECT gc.id, gc.name, gc.avatar_color,
-               (SELECT gm2.text FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_text,
-               (SELECT gm2.image_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_image,
-               (SELECT gm2.audio_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_audio,
-               (SELECT gm2.file_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_file,
-               (SELECT MAX(gm3.created_at) FROM group_messages gm3 WHERE gm3.group_id = gc.id) AS last_time,
-               (SELECT COUNT(*) FROM group_members gmem2 WHERE gmem2.group_id = gc.id) AS member_count
+               last_msg.text AS last_text,
+               last_msg.image_data IS NOT NULL AS last_has_image,
+               last_msg.audio_data IS NOT NULL AS last_has_audio,
+               last_msg.file_data IS NOT NULL AS last_has_file,
+               last_msg.created_at AS last_time,
+               member_counts.member_count
         FROM group_chats gc
         JOIN group_members gmem ON gmem.group_id = gc.id AND gmem.user_id = ?
-        ORDER BY last_time DESC, gc.name ASC
+        LEFT JOIN (
+          SELECT gm.group_id, gm.text, gm.image_data, gm.audio_data, gm.file_data, gm.created_at
+          FROM group_messages gm
+          INNER JOIN (
+            SELECT group_id, MAX(id) AS max_id
+            FROM group_messages
+            WHERE is_deleted = 0
+            GROUP BY group_id
+          ) latest ON gm.id = latest.max_id
+        ) last_msg ON last_msg.group_id = gc.id
+        LEFT JOIN (
+          SELECT group_id, COUNT(*) AS member_count
+          FROM group_members
+          GROUP BY group_id
+        ) member_counts ON member_counts.group_id = gc.id
+        ORDER BY last_msg.created_at DESC, gc.name ASC
       `;
             const [rows] = await db.execute(query, [userId]);
 
             const groups = rows.map(g => {
-                let preview = g.last_text || '';
+                let preview = g.last_text ? decrypt(g.last_text) : '';
                 if (g.last_has_image) preview = '🖼️ Фотография';
                 else if (g.last_has_audio) preview = '🎙️ Голосовое сообщение';
                 else if (g.last_has_file) preview = '📄 Файл';
@@ -305,7 +342,7 @@ module.exports = (io, socket) => {
                     avatarColor: g.avatar_color || '#5865F2',
                     lastMessage: preview,
                     lastMessageAt: g.last_time,
-                    memberCount: g.member_count
+                    memberCount: g.member_count || 0
                 };
             });
             cb?.({ ok: true, data: groups });
@@ -392,6 +429,7 @@ module.exports = (io, socket) => {
 
             const history = rows.map(m => {
                 m.msg_type = detectMsgType(m);
+                decryptMsg(m);
                 return toHistoryPreview(m);
             });
 
@@ -420,16 +458,24 @@ module.exports = (io, socket) => {
     socket.on('group:send', async ({ groupId, text, file }, cb) => {
         try {
             const { image_data, audio_data, file_data, file_name, msg_type } = splitIncomingFile(file);
+            const encryptedText = (text && msg_type === 'text') ? encrypt(text) : (text || '');
 
             const [result] = await db.execute(
                 `INSERT INTO group_messages (group_id, sender_id, text, image_data, audio_data, file_data, file_name)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [groupId, userId, text || '', image_data, audio_data, file_data, file_name]
+                [groupId, userId, encryptedText, image_data, audio_data, file_data, file_name]
             );
 
             const [rows] = await db.execute('SELECT * FROM group_messages WHERE id = ?', [result.insertId]);
+
+            // Диагностика голосовых сообщений
+            if (msg_type === 'audio') {
+                console.log(`[Голосовое-группа] id=${rows[0].id} группа=${groupId} от=${userId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
+            }
+
             const saved = toBase64(rows[0]);
             saved.msg_type = msg_type;
+            saved.text = decrypt(saved.text);
 
             io.to(`group_${groupId}`).emit('group:message:new', saved);
 
@@ -462,9 +508,10 @@ module.exports = (io, socket) => {
 
     socket.on('group:edit', async ({ groupId, msgId, text }, cb) => {
         try {
+            const encryptedText = encrypt(text);
             const [result] = await db.execute(
                 'UPDATE group_messages SET text = ? WHERE id = ? AND sender_id = ?',
-                [text, msgId, userId]
+                [encryptedText, msgId, userId]
             );
             if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
 

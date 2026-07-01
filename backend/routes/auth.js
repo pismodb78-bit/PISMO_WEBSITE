@@ -108,6 +108,10 @@ router.post('/change-password', authGuard, async (req, res) => {
         return res.status(400).json({ message: 'Необходимо указать старый и новый пароли' });
     }
 
+    if (newPassword.length < 4) {
+        return res.status(400).json({ message: 'Новый пароль слишком короткий (минимум 4 символа)' });
+    }
+
     try {
         const [users] = await db.query('SELECT password FROM users WHERE id = ?', [userId]);
         if (users.length === 0) {
@@ -115,6 +119,8 @@ router.post('/change-password', authGuard, async (req, res) => {
         }
 
         const currentPasswordHash = users[0].password;
+
+        // Проверяем bcrypt (веб) и plain text (легаси десктоп)
         let isMatch = await bcrypt.compare(oldPassword, currentPasswordHash).catch(() => false);
         if (!isMatch && oldPassword === currentPasswordHash) {
             isMatch = true;
@@ -122,6 +128,14 @@ router.post('/change-password', authGuard, async (req, res) => {
 
         if (!isMatch) {
             return res.status(400).json({ message: 'Старый пароль указан неверно' });
+        }
+
+        // Новый пароль не должен совпадать со старым (учитываем и bcrypt, и legacy plain text)
+        let sameAsOld = await bcrypt.compare(newPassword, currentPasswordHash).catch(() => false);
+        if (!sameAsOld && newPassword === currentPasswordHash) sameAsOld = true;
+
+        if (newPassword === oldPassword || sameAsOld) {
+            return res.status(400).json({ message: 'Новый пароль совпадает со старым' });
         }
 
         const hashedNewPassword = await bcrypt.hash(newPassword, 10);
