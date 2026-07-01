@@ -43,7 +43,10 @@ function splitIncomingFile(file) {
         const mime = file.mime || '';
         const lowerName = (file_name || '').toLowerCase();
 
-        if (mime.startsWith('image/')) {
+        if (mime.startsWith('image/') || /\.(jpe?g|png|gif|webp|bmp)$/i.test(lowerName)) {
+            // Иногда браузер не проставляет mime у файла (file.type === '') — тогда
+            // картинка ошибочно уходила как «файл» и рендерилась блоком 📄 с GUID-именем
+            // поверх изображения. Подстраховываемся распознаванием по расширению.
             msg_type = 'image';
             image_data = buffer;
         } else if (
@@ -208,6 +211,11 @@ module.exports = (io, socket) => {
             );
 
             const [rows] = await db.execute('SELECT * FROM messages WHERE id = ?', [result.insertId]);
+            // Диагностика голосовых: получено vs реально в БД. Если "в БД" меньше —
+            // колонку audio_data режет обычный BLOB (64 КБ), нужен LONGBLOB.
+            if (msg_type === 'audio') {
+                console.log(`[Голосовое] id=${rows[0].id} ${userId}→${receiverId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
+            }
             const saved = toBase64(rows[0]);
 
             io.to(`chat_${receiverId}`).to(`chat_${userId}`).emit('message:new', saved);
@@ -278,17 +286,36 @@ module.exports = (io, socket) => {
 
     socket.on('groups:list', async (_payload, cb) => {
         try {
+            // Одним проходом: последнее НЕудалённое сообщение по каждой группе через
+            // ROW_NUMBER() (как в conversations:list) + число участников отдельным агрегатом.
+            // Раньше на каждую группу было 5 коррелированных подзапросов — отсюда тормоза.
             const query = `
         SELECT gc.id, gc.name, gc.avatar_color,
-               (SELECT gm2.text FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_text,
-               (SELECT gm2.image_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_image,
-               (SELECT gm2.audio_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_audio,
-               (SELECT gm2.file_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_file,
-               (SELECT MAX(gm3.created_at) FROM group_messages gm3 WHERE gm3.group_id = gc.id) AS last_time,
-               (SELECT COUNT(*) FROM group_members gmem2 WHERE gmem2.group_id = gc.id) AS member_count
+               lm.text AS last_text,
+               lm.has_image AS last_has_image,
+               lm.has_audio AS last_has_audio,
+               lm.has_file  AS last_has_file,
+               lm.created_at AS last_time,
+               COALESCE(mc.member_count, 0) AS member_count
         FROM group_chats gc
         JOIN group_members gmem ON gmem.group_id = gc.id AND gmem.user_id = ?
-        ORDER BY last_time DESC, gc.name ASC
+        LEFT JOIN (
+          SELECT x.group_id, x.text, x.has_image, x.has_audio, x.has_file, x.created_at
+          FROM (
+            SELECT gm.group_id, gm.text,
+                   (gm.image_data IS NOT NULL) AS has_image,
+                   (gm.audio_data IS NOT NULL) AS has_audio,
+                   (gm.file_data  IS NOT NULL) AS has_file,
+                   gm.created_at,
+                   ROW_NUMBER() OVER (PARTITION BY gm.group_id ORDER BY gm.created_at DESC) AS rn
+            FROM group_messages gm
+            WHERE gm.is_deleted = 0
+          ) x WHERE x.rn = 1
+        ) lm ON lm.group_id = gc.id
+        LEFT JOIN (
+          SELECT group_id, COUNT(*) AS member_count FROM group_members GROUP BY group_id
+        ) mc ON mc.group_id = gc.id
+        ORDER BY lm.created_at DESC, gc.name ASC
       `;
             const [rows] = await db.execute(query, [userId]);
 
@@ -428,6 +455,9 @@ module.exports = (io, socket) => {
             );
 
             const [rows] = await db.execute('SELECT * FROM group_messages WHERE id = ?', [result.insertId]);
+            if (msg_type === 'audio') {
+                console.log(`[Голосовое-группа] id=${rows[0].id} группа=${groupId} от=${userId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
+            }
             const saved = toBase64(rows[0]);
             saved.msg_type = msg_type;
 
