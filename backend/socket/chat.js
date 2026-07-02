@@ -45,7 +45,10 @@ function splitIncomingFile(file) {
         const mime = (file.mime || '').toLowerCase();
         const lowerName = (file_name || '').toLowerCase();
 
-        if (mime.startsWith('image/')) {
+        if (mime.startsWith('image/') || /\.(jpe?g|png|gif|webp|bmp)$/i.test(lowerName)) {
+            // Иногда браузер не проставляет mime у файла (file.type === '') — тогда
+            // картинка ошибочно уходила как «файл» и рендерилась блоком 📄 с GUID-именем
+            // поверх изображения. Подстраховываемся распознаванием по расширению.
             msg_type = 'image';
             image_data = buffer;
         } else if (
@@ -202,6 +205,7 @@ module.exports = (io, socket) => {
     socket.on('chat:send', async ({ receiverId, text, file }, cb) => {
         try {
             const { image_data, audio_data, file_data, file_name, msg_type } = splitIncomingFile(file);
+            const encryptedText = (text && msg_type === 'text') ? encrypt(text) : (text || null);
 
             // Шифруем только текстовые сообщения (файлы/медиа в BLOB не шифруем)
             const textToSave = (text && msg_type === 'text') ? encrypt(text) : (text || null);
@@ -213,7 +217,15 @@ module.exports = (io, socket) => {
             );
 
             const [rows] = await db.execute('SELECT * FROM messages WHERE id = ?', [result.insertId]);
+
+            // Диагностика голосовых: получено vs реально в БД.
+            if (msg_type === 'audio') {
+                console.log(`[Голосовое] id=${rows[0].id} ${userId}→${receiverId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
+            }
+
             const saved = toBase64(rows[0]);
+            // расшифровываем перед отправкой клиентам
+            saved.text = decrypt(saved.text);
 
             // Расшифровываем перед отправкой клиентам — они должны видеть открытый текст
             saved.text = decrypt(saved.text);
@@ -288,17 +300,33 @@ module.exports = (io, socket) => {
 
     socket.on('groups:list', async (_payload, cb) => {
         try {
+            // Используем надежный рабочий запрос с MAX(id) из первого файла
             const query = `
         SELECT gc.id, gc.name, gc.avatar_color,
-               (SELECT gm2.text FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_text,
-               (SELECT gm2.image_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_image,
-               (SELECT gm2.audio_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_audio,
-               (SELECT gm2.file_data IS NOT NULL FROM group_messages gm2 WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0 ORDER BY gm2.created_at DESC LIMIT 1) AS last_has_file,
-               (SELECT MAX(gm3.created_at) FROM group_messages gm3 WHERE gm3.group_id = gc.id) AS last_time,
-               (SELECT COUNT(*) FROM group_members gmem2 WHERE gmem2.group_id = gc.id) AS member_count
+               last_msg.text AS last_text,
+               last_msg.image_data IS NOT NULL AS last_has_image,
+               last_msg.audio_data IS NOT NULL AS last_has_audio,
+               last_msg.file_data IS NOT NULL AS last_has_file,
+               last_msg.created_at AS last_time,
+               member_counts.member_count
         FROM group_chats gc
         JOIN group_members gmem ON gmem.group_id = gc.id AND gmem.user_id = ?
-        ORDER BY last_time DESC, gc.name ASC
+        LEFT JOIN (
+          SELECT gm.group_id, gm.text, gm.image_data, gm.audio_data, gm.file_data, gm.created_at
+          FROM group_messages gm
+          INNER JOIN (
+            SELECT group_id, MAX(id) AS max_id
+            FROM group_messages
+            WHERE is_deleted = 0
+            GROUP BY group_id
+          ) latest ON gm.id = latest.max_id
+        ) last_msg ON last_msg.group_id = gc.id
+        LEFT JOIN (
+          SELECT group_id, COUNT(*) AS member_count
+          FROM group_members
+          GROUP BY group_id
+        ) member_counts ON member_counts.group_id = gc.id
+        ORDER BY last_msg.created_at DESC, gc.name ASC
       `;
             const [rows] = await db.execute(query, [userId]);
 
@@ -316,7 +344,7 @@ module.exports = (io, socket) => {
                     avatarColor: g.avatar_color || '#5865F2',
                     lastMessage: preview,
                     lastMessageAt: g.last_time,
-                    memberCount: g.member_count
+                    memberCount: g.member_count || 0
                 };
             });
             cb?.({ ok: true, data: groups });
@@ -431,6 +459,7 @@ module.exports = (io, socket) => {
     socket.on('group:send', async ({ groupId, text, file }, cb) => {
         try {
             const { image_data, audio_data, file_data, file_name, msg_type } = splitIncomingFile(file);
+            const encryptedText = (text && msg_type === 'text') ? encrypt(text) : (text || '');
 
             // Шифруем только текст
             const textToSave = (text && msg_type === 'text') ? encrypt(text) : (text || '');
@@ -442,8 +471,15 @@ module.exports = (io, socket) => {
             );
 
             const [rows] = await db.execute('SELECT * FROM group_messages WHERE id = ?', [result.insertId]);
+
+            // Диагностика голосовых сообщений
+            if (msg_type === 'audio') {
+                console.log(`[Голосовое-группа] id=${rows[0].id} группа=${groupId} от=${userId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
+            }
+
             const saved = toBase64(rows[0]);
             saved.msg_type = msg_type;
+            saved.text = decrypt(saved.text);
 
             // Расшифровываем перед рассылкой клиентам
             saved.text = decrypt(saved.text);
