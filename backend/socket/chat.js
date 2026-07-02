@@ -1,4 +1,5 @@
 const db = require('../db');
+const { encrypt, decrypt } = require('./crypto');
 
 function toBase64(msg) {
     if (msg.image_data) msg.image_data = msg.image_data.toString('base64');
@@ -14,10 +15,6 @@ function detectMsgType(msg) {
     return 'text';
 }
 
-// Для истории чата НЕ включаем тяжёлые BLOB-поля целиком — иначе при большом
-// количестве файлов JSON.stringify падает с RangeError: Invalid string length.
-// Вместо данных отдаём только флаги наличия; сами данные подгружаются по требованию
-// через 'message:file' / 'group:message:file', когда сообщение реально рендерится.
 function toHistoryPreview(msg) {
     const hasImage = !!msg.image_data;
     const hasAudio = !!msg.audio_data;
@@ -33,14 +30,19 @@ function toHistoryPreview(msg) {
     return msg;
 }
 
-// Раскладывает входящий base64-файл по нужной колонке (раньше это делал multer)
+// Расшифровывает текст сообщения перед отправкой клиенту
+function decryptMsg(msg) {
+    if (msg.text) msg.text = decrypt(msg.text);
+    return msg;
+}
+
 function splitIncomingFile(file) {
     let image_data = null, audio_data = null, file_data = null, file_name = null, msg_type = 'text';
 
     if (file && file.data) {
         const buffer = Buffer.from(file.data, 'base64');
         file_name = file.name || null;
-        const mime = file.mime || '';
+        const mime = (file.mime || '').toLowerCase();
         const lowerName = (file_name || '').toLowerCase();
 
         if (mime.startsWith('image/') || /\.(jpe?g|png|gif|webp|bmp)$/i.test(lowerName)) {
@@ -68,7 +70,6 @@ function splitIncomingFile(file) {
 module.exports = (io, socket) => {
     const userId = socket.userId;
 
-    // ── Автоприсоединение к личной комнате и всем группам пользователя ──
     socket.join(`user_${userId}`);
     (async () => {
         try {
@@ -128,7 +129,8 @@ module.exports = (io, socket) => {
             const [rows] = await db.execute(query, params);
 
             const result = rows.map(r => {
-                let preview = r.lastMessage || '';
+                // Расшифровываем превью последнего сообщения для сайдбара
+                let preview = r.lastMessage ? decrypt(r.lastMessage) : '';
                 let type = r.lastMsgType;
                 if (r.lastHasImage) type = 'image';
                 else if (r.lastHasAudio) type = 'audio';
@@ -165,6 +167,7 @@ module.exports = (io, socket) => {
             const history = rows.map(m => {
                 const detected = detectMsgType(m);
                 m.msg_type = detected !== 'text' ? detected : (m.msg_type || 'text');
+                decryptMsg(m); // расшифровываем перед отправкой клиенту
                 return toHistoryPreview(m);
             });
 
@@ -185,7 +188,6 @@ module.exports = (io, socket) => {
         socket.leave(`chat_${partnerId}`);
     });
 
-    // Подгрузка файла конкретного личного сообщения по требованию
     socket.on('message:file', async ({ msgId }, cb) => {
         try {
             const [rows] = await db.execute(
@@ -203,20 +205,30 @@ module.exports = (io, socket) => {
     socket.on('chat:send', async ({ receiverId, text, file }, cb) => {
         try {
             const { image_data, audio_data, file_data, file_name, msg_type } = splitIncomingFile(file);
+            const encryptedText = (text && msg_type === 'text') ? encrypt(text) : (text || null);
+
+            // Шифруем только текстовые сообщения (файлы/медиа в BLOB не шифруем)
+            const textToSave = (text && msg_type === 'text') ? encrypt(text) : (text || null);
 
             const [result] = await db.execute(
                 `INSERT INTO messages (sender_id, receiver_id, text, image_data, audio_data, file_data, file_name, msg_type)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [userId, receiverId, text || null, image_data, audio_data, file_data, file_name, msg_type]
+                [userId, receiverId, textToSave, image_data, audio_data, file_data, file_name, msg_type]
             );
 
             const [rows] = await db.execute('SELECT * FROM messages WHERE id = ?', [result.insertId]);
-            // Диагностика голосовых: получено vs реально в БД. Если "в БД" меньше —
-            // колонку audio_data режет обычный BLOB (64 КБ), нужен LONGBLOB.
+
+            // Диагностика голосовых: получено vs реально в БД.
             if (msg_type === 'audio') {
                 console.log(`[Голосовое] id=${rows[0].id} ${userId}→${receiverId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
             }
+
             const saved = toBase64(rows[0]);
+            // расшифровываем перед отправкой клиентам
+            saved.text = decrypt(saved.text);
+
+            // Расшифровываем перед отправкой клиентам — они должны видеть открытый текст
+            saved.text = decrypt(saved.text);
 
             io.to(`chat_${receiverId}`).to(`chat_${userId}`).emit('message:new', saved);
 
@@ -244,12 +256,14 @@ module.exports = (io, socket) => {
 
     socket.on('chat:edit', async ({ chatId, msgId, text }, cb) => {
         try {
+            // Сохраняем отредактированный текст зашифрованным
             const [result] = await db.execute(
                 'UPDATE messages SET text = ? WHERE id = ? AND sender_id = ?',
-                [text, msgId, userId]
+                [encrypt(text), msgId, userId]
             );
             if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
 
+            // Клиентам рассылаем уже расшифрованный текст
             io.to(`chat_${chatId}`).to(`chat_${userId}`).emit('message:edit', { id: msgId, text });
             cb?.({ ok: true });
         } catch (err) {
@@ -286,41 +300,39 @@ module.exports = (io, socket) => {
 
     socket.on('groups:list', async (_payload, cb) => {
         try {
-            // Одним проходом: последнее НЕудалённое сообщение по каждой группе через
-            // ROW_NUMBER() (как в conversations:list) + число участников отдельным агрегатом.
-            // Раньше на каждую группу было 5 коррелированных подзапросов — отсюда тормоза.
+            // Используем надежный рабочий запрос с MAX(id) из первого файла
             const query = `
         SELECT gc.id, gc.name, gc.avatar_color,
-               lm.text AS last_text,
-               lm.has_image AS last_has_image,
-               lm.has_audio AS last_has_audio,
-               lm.has_file  AS last_has_file,
-               lm.created_at AS last_time,
-               COALESCE(mc.member_count, 0) AS member_count
+               last_msg.text AS last_text,
+               last_msg.image_data IS NOT NULL AS last_has_image,
+               last_msg.audio_data IS NOT NULL AS last_has_audio,
+               last_msg.file_data IS NOT NULL AS last_has_file,
+               last_msg.created_at AS last_time,
+               member_counts.member_count
         FROM group_chats gc
         JOIN group_members gmem ON gmem.group_id = gc.id AND gmem.user_id = ?
         LEFT JOIN (
-          SELECT x.group_id, x.text, x.has_image, x.has_audio, x.has_file, x.created_at
-          FROM (
-            SELECT gm.group_id, gm.text,
-                   (gm.image_data IS NOT NULL) AS has_image,
-                   (gm.audio_data IS NOT NULL) AS has_audio,
-                   (gm.file_data  IS NOT NULL) AS has_file,
-                   gm.created_at,
-                   ROW_NUMBER() OVER (PARTITION BY gm.group_id ORDER BY gm.created_at DESC) AS rn
-            FROM group_messages gm
-            WHERE gm.is_deleted = 0
-          ) x WHERE x.rn = 1
-        ) lm ON lm.group_id = gc.id
+          SELECT gm.group_id, gm.text, gm.image_data, gm.audio_data, gm.file_data, gm.created_at
+          FROM group_messages gm
+          INNER JOIN (
+            SELECT group_id, MAX(id) AS max_id
+            FROM group_messages
+            WHERE is_deleted = 0
+            GROUP BY group_id
+          ) latest ON gm.id = latest.max_id
+        ) last_msg ON last_msg.group_id = gc.id
         LEFT JOIN (
-          SELECT group_id, COUNT(*) AS member_count FROM group_members GROUP BY group_id
-        ) mc ON mc.group_id = gc.id
-        ORDER BY lm.created_at DESC, gc.name ASC
+          SELECT group_id, COUNT(*) AS member_count
+          FROM group_members
+          GROUP BY group_id
+        ) member_counts ON member_counts.group_id = gc.id
+        ORDER BY last_msg.created_at DESC, gc.name ASC
       `;
             const [rows] = await db.execute(query, [userId]);
 
             const groups = rows.map(g => {
-                let preview = g.last_text || '';
+                // Расшифровываем превью последнего сообщения группы
+                let preview = g.last_text ? decrypt(g.last_text) : '';
                 if (g.last_has_image) preview = '🖼️ Фотография';
                 else if (g.last_has_audio) preview = '🎙️ Голосовое сообщение';
                 else if (g.last_has_file) preview = '📄 Файл';
@@ -332,7 +344,7 @@ module.exports = (io, socket) => {
                     avatarColor: g.avatar_color || '#5865F2',
                     lastMessage: preview,
                     lastMessageAt: g.last_time,
-                    memberCount: g.member_count
+                    memberCount: g.member_count || 0
                 };
             });
             cb?.({ ok: true, data: groups });
@@ -419,6 +431,7 @@ module.exports = (io, socket) => {
 
             const history = rows.map(m => {
                 m.msg_type = detectMsgType(m);
+                decryptMsg(m); // расшифровываем перед отправкой клиенту
                 return toHistoryPreview(m);
             });
 
@@ -429,7 +442,6 @@ module.exports = (io, socket) => {
         }
     });
 
-    // Подгрузка файла конкретного группового сообщения по требованию
     socket.on('group:message:file', async ({ msgId }, cb) => {
         try {
             const [rows] = await db.execute(
@@ -447,19 +459,30 @@ module.exports = (io, socket) => {
     socket.on('group:send', async ({ groupId, text, file }, cb) => {
         try {
             const { image_data, audio_data, file_data, file_name, msg_type } = splitIncomingFile(file);
+            const encryptedText = (text && msg_type === 'text') ? encrypt(text) : (text || '');
+
+            // Шифруем только текст
+            const textToSave = (text && msg_type === 'text') ? encrypt(text) : (text || '');
 
             const [result] = await db.execute(
                 `INSERT INTO group_messages (group_id, sender_id, text, image_data, audio_data, file_data, file_name)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [groupId, userId, text || '', image_data, audio_data, file_data, file_name]
+                [groupId, userId, textToSave, image_data, audio_data, file_data, file_name]
             );
 
             const [rows] = await db.execute('SELECT * FROM group_messages WHERE id = ?', [result.insertId]);
+
+            // Диагностика голосовых сообщений
             if (msg_type === 'audio') {
                 console.log(`[Голосовое-группа] id=${rows[0].id} группа=${groupId} от=${userId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
             }
+
             const saved = toBase64(rows[0]);
             saved.msg_type = msg_type;
+            saved.text = decrypt(saved.text);
+
+            // Расшифровываем перед рассылкой клиентам
+            saved.text = decrypt(saved.text);
 
             io.to(`group_${groupId}`).emit('group:message:new', saved);
 
@@ -492,9 +515,10 @@ module.exports = (io, socket) => {
 
     socket.on('group:edit', async ({ groupId, msgId, text }, cb) => {
         try {
+            // Сохраняем зашифрованным, клиентам рассылаем открытый текст
             const [result] = await db.execute(
                 'UPDATE group_messages SET text = ? WHERE id = ? AND sender_id = ?',
-                [text, msgId, userId]
+                [encrypt(text), msgId, userId]
             );
             if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
 
