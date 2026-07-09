@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { emitAsync } from '../../socket';
 import { useNotifications } from '../../context/NotificationContext';
+import { useCall } from '../../context/CallContext'; // Импортируем хук звонков
 
 function detectAudioMime(base64Data) {
     if (!base64Data || base64Data.length < 16) return 'audio/wav';
@@ -47,11 +48,6 @@ function fileToPayload(file) {
     });
 }
 
-// Подгружает данные файла сообщения по требованию (история не содержит BLOB-данные
-// целиком, только флаги has_image/has_audio/has_file — иначе ломается JSON.stringify
-// при большом объёме медиа). Сообщения, отправленные в текущей сессии через chat:send/
-// group:send, уже приходят с готовыми данными (image_data/audio_data/file_data),
-// поэтому повторный запрос для них не делается.
 const LazyMedia = ({ msg, isGroup }) => {
     const hasInlineData = !!(msg.image_data || msg.audio_data || msg.file_data);
     const [fileData, setFileData] = useState(hasInlineData ? msg : null);
@@ -131,6 +127,7 @@ const ChatWindow = ({ activeChat, user, socket }) => {
     }
 
     const { clearUnread } = useNotifications();
+    const { startCall } = useCall(); // Извлекаем метод запуска звонка из контекста
 
     const [messages, setMessages] = useState([]);
     const [inputText, setInputText] = useState('');
@@ -138,9 +135,6 @@ const ChatWindow = ({ activeChat, user, socket }) => {
     const [isRecording, setIsRecording] = useState(false);
     const [editingMsgId, setEditingMsgId] = useState(null);
     const [editText, setEditText] = useState('');
-    // Счётчик "сброса кеша": входит в key каждого LazyMedia. Инкремент заставляет
-    // React перемонтировать медиа-компоненты и заново запросить файлы с сервера
-    // (иначе при том же key={msg.id} useEffect по msg.id не срабатывает и висят старые данные).
     const [cacheBust, setCacheBust] = useState(0);
 
     const messagesEndRef = useRef(null);
@@ -253,7 +247,7 @@ const ChatWindow = ({ activeChat, user, socket }) => {
 
     useEffect(() => {
         const handleClearCache = () => {
-            setCacheBust((c) => c + 1); // форсируем перемонтирование LazyMedia
+            setCacheBust((c) => c + 1);
             fetchMessages();
         };
         window.addEventListener('pismo:clear-media-cache', handleClearCache);
@@ -304,14 +298,11 @@ const ChatWindow = ({ activeChat, user, socket }) => {
             return;
         }
         try {
-            // Учитываем выбранный в настройках устройств микрофон, если он есть.
             const savedMicId = localStorage.getItem('pismo_mic_device_id');
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: savedMicId ? { deviceId: { exact: savedMicId } } : true
             });
 
-            // Берём контейнер, который браузер реально поддерживает (Chrome/FF — webm/opus,
-            // Safari — mp4). Жёсткий audio/webm ломал запись/воспроизведение в части браузеров.
             const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
             const chosenMime = preferred.find(t => window.MediaRecorder.isTypeSupported(t)) || '';
             mediaRecorderRef.current = chosenMime
@@ -382,8 +373,10 @@ const ChatWindow = ({ activeChat, user, socket }) => {
 
     const styles = {
         container: { flex: 1, backgroundColor: 'var(--bg-primary)', display: 'flex', flexDirection: 'column', height: '100vh' },
-        header: { height: '60px', backgroundColor: 'var(--bg-primary)', display: 'flex', alignItems: 'center', padding: '0 20px', borderBottom: '1px solid rgba(0,0,0,0.3)' },
+        header: { height: '60px', backgroundColor: 'var(--bg-primary)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 20px', borderBottom: '1px solid rgba(0,0,0,0.3)' },
         headerTitle: { color: '#fff', fontSize: '16px', fontWeight: '600' },
+        headerActions: { display: 'flex', gap: '12px', alignItems: 'center' },
+        callBtn: { background: 'none', border: 'none', fontSize: '20px', cursor: 'pointer', padding: '4px 8px', borderRadius: '4px', display: 'flex', alignItems: 'center', transition: 'background 0.2s' },
         messagesArea: { flex: 1, padding: '20px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' },
         emptyState: { margin: 'auto', color: 'var(--text-muted)', fontSize: '15px', textAlign: 'center', maxWidth: '360px', lineHeight: '1.5' },
         messageRow: { display: 'flex', alignItems: 'flex-start' },
@@ -403,10 +396,46 @@ const ChatWindow = ({ activeChat, user, socket }) => {
     };
 
     return (
+        /* Вот этот самый тег случайно удалился: */
         <div style={styles.container}>
             <div style={styles.header}>
                 <div style={styles.headerTitle}>
                     {activeChat.isGroup ? `👥 ${activeChat.Name}` : (activeChat.Name || activeChat.login)}
+                </div>
+
+                {/* Блок кнопок звонка */}
+                {/* Блок кнопок звонка */}
+                <div style={styles.headerActions}>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            console.log('📞 Нажата кнопка аудиозвонка. Данные чата:', activeChat);
+                            startCall({
+                                calleeId: activeChat.isGroup ? undefined : activeChat.id,
+                                groupId: activeChat.isGroup ? activeChat.id : undefined,
+                                hasVideo: false
+                            });
+                        }}
+                        style={styles.callBtn}
+                        title="Аудиозвонок"
+                    >
+                        📞
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            console.log('📹 Нажата кнопка видеозвонка. Данные чата:', activeChat);
+                            startCall({
+                                calleeId: activeChat.isGroup ? undefined : activeChat.id,
+                                groupId: activeChat.isGroup ? activeChat.id : undefined,
+                                hasVideo: true
+                            });
+                        }}
+                        style={styles.callBtn}
+                        title="Видеозвонок"
+                    >
+                        📹
+                    </button>
                 </div>
             </div>
             <div style={styles.messagesArea}>

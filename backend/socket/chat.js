@@ -1,4 +1,5 @@
 const db = require('../db');
+const { enc, dec } = require('../utils/crypto');
 
 function toBase64(msg) {
     if (msg.image_data) msg.image_data = msg.image_data.toString('base64');
@@ -96,39 +97,38 @@ module.exports = (io, socket) => {
     socket.on('conversations:list', async (_payload, cb) => {
         try {
             const query = `
-        SELECT
-          partner_id,
-          lm.text AS lastMessage, lm.msg_type AS lastMsgType,
-          lm.image_data IS NOT NULL AS lastHasImage,
-          lm.audio_data IS NOT NULL AS lastHasAudio,
-          lm.file_data IS NOT NULL AS lastHasFile,
-          lm.created_at AS lastMessageAt,
-          u.unreadCount
-        FROM (
-          SELECT CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END AS partner_id
-          FROM messages WHERE sender_id = ? OR receiver_id = ? GROUP BY partner_id
-        ) p
-        JOIN (
-          SELECT x.partner_id, x.text, x.msg_type, x.image_data, x.audio_data, x.file_data, x.created_at
-          FROM (
-            SELECT
-              CASE WHEN m.sender_id = ? THEN m.receiver_id ELSE m.sender_id END AS partner_id,
-              m.text, m.msg_type, m.image_data, m.audio_data, m.file_data, m.created_at,
-              ROW_NUMBER() OVER (PARTITION BY (CASE WHEN m.sender_id = ? THEN m.receiver_id ELSE m.sender_id END) ORDER BY m.created_at DESC) AS rn
-            FROM messages m WHERE (m.sender_id = ? OR m.receiver_id = ?)
-          ) x WHERE x.rn = 1
-        ) lm ON lm.partner_id = p.partner_id
-        LEFT JOIN (
-          SELECT sender_id AS partner_id, COUNT(*) AS unreadCount
-          FROM messages WHERE receiver_id = ? AND is_read = 0 GROUP BY sender_id
-        ) u ON u.partner_id = p.partner_id
-        ORDER BY lm.created_at DESC
-      `;
-            const params = [userId, userId, userId, userId, userId, userId, userId, userId];
+      SELECT
+        partner_id,
+        lm.text AS lastMessage, lm.msg_type AS lastMsgType,
+        (lm.image_data IS NOT NULL) AS lastHasImage,
+        (lm.audio_data IS NOT NULL) AS lastHasAudio,
+        (lm.file_data  IS NOT NULL) AS lastHasFile,
+        lm.created_at AS lastMessageAt,
+        u.unreadCount
+      FROM (
+        SELECT CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END AS partner_id
+        FROM messages WHERE sender_id = ? OR receiver_id = ? GROUP BY partner_id
+      ) p
+      JOIN messages lm
+        ON lm.id = (
+          SELECT m2.id
+          FROM messages m2
+          WHERE (m2.sender_id = ? AND m2.receiver_id = p.partner_id)
+             OR (m2.sender_id = p.partner_id AND m2.receiver_id = ?)
+          ORDER BY m2.created_at DESC, m2.id DESC
+          LIMIT 1
+        )
+      LEFT JOIN (
+        SELECT sender_id AS partner_id, COUNT(*) AS unreadCount
+        FROM messages WHERE receiver_id = ? AND is_read = 0 GROUP BY sender_id
+      ) u ON u.partner_id = p.partner_id
+      ORDER BY lm.created_at DESC
+    `;
+            const params = [userId, userId, userId, userId, userId, userId];
             const [rows] = await db.execute(query, params);
 
             const result = rows.map(r => {
-                let preview = r.lastMessage || '';
+                let preview = dec(r.lastMessage) || '';
                 let type = r.lastMsgType;
                 if (r.lastHasImage) type = 'image';
                 else if (r.lastHasAudio) type = 'audio';
@@ -165,6 +165,7 @@ module.exports = (io, socket) => {
             const history = rows.map(m => {
                 const detected = detectMsgType(m);
                 m.msg_type = detected !== 'text' ? detected : (m.msg_type || 'text');
+                m.text = dec(m.text);
                 return toHistoryPreview(m);
             });
 
@@ -207,7 +208,7 @@ module.exports = (io, socket) => {
             const [result] = await db.execute(
                 `INSERT INTO messages (sender_id, receiver_id, text, image_data, audio_data, file_data, file_name, msg_type)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [userId, receiverId, text || null, image_data, audio_data, file_data, file_name, msg_type]
+                [userId, receiverId, enc(text) || null, image_data, audio_data, file_data, file_name, msg_type]
             );
 
             const [rows] = await db.execute('SELECT * FROM messages WHERE id = ?', [result.insertId]);
@@ -217,6 +218,7 @@ module.exports = (io, socket) => {
                 console.log(`[Голосовое] id=${rows[0].id} ${userId}→${receiverId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
             }
             const saved = toBase64(rows[0]);
+            saved.text = dec(saved.text);
 
             io.to(`chat_${receiverId}`).to(`chat_${userId}`).emit('message:new', saved);
 
@@ -246,7 +248,7 @@ module.exports = (io, socket) => {
         try {
             const [result] = await db.execute(
                 'UPDATE messages SET text = ? WHERE id = ? AND sender_id = ?',
-                [text, msgId, userId]
+                [enc(text), msgId, userId]
             );
             if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
 
@@ -286,41 +288,33 @@ module.exports = (io, socket) => {
 
     socket.on('groups:list', async (_payload, cb) => {
         try {
-            // Одним проходом: последнее НЕудалённое сообщение по каждой группе через
-            // ROW_NUMBER() (как в conversations:list) + число участников отдельным агрегатом.
-            // Раньше на каждую группу было 5 коррелированных подзапросов — отсюда тормоза.
             const query = `
-        SELECT gc.id, gc.name, gc.avatar_color,
-               lm.text AS last_text,
-               lm.has_image AS last_has_image,
-               lm.has_audio AS last_has_audio,
-               lm.has_file  AS last_has_file,
-               lm.created_at AS last_time,
-               COALESCE(mc.member_count, 0) AS member_count
-        FROM group_chats gc
-        JOIN group_members gmem ON gmem.group_id = gc.id AND gmem.user_id = ?
-        LEFT JOIN (
-          SELECT x.group_id, x.text, x.has_image, x.has_audio, x.has_file, x.created_at
-          FROM (
-            SELECT gm.group_id, gm.text,
-                   (gm.image_data IS NOT NULL) AS has_image,
-                   (gm.audio_data IS NOT NULL) AS has_audio,
-                   (gm.file_data  IS NOT NULL) AS has_file,
-                   gm.created_at,
-                   ROW_NUMBER() OVER (PARTITION BY gm.group_id ORDER BY gm.created_at DESC) AS rn
-            FROM group_messages gm
-            WHERE gm.is_deleted = 0
-          ) x WHERE x.rn = 1
-        ) lm ON lm.group_id = gc.id
-        LEFT JOIN (
-          SELECT group_id, COUNT(*) AS member_count FROM group_members GROUP BY group_id
-        ) mc ON mc.group_id = gc.id
-        ORDER BY lm.created_at DESC, gc.name ASC
-      `;
+      SELECT gc.id, gc.name, gc.avatar_color,
+             lm.text AS last_text,
+             (lm.image_data IS NOT NULL) AS last_has_image,
+             (lm.audio_data IS NOT NULL) AS last_has_audio,
+             (lm.file_data  IS NOT NULL) AS last_has_file,
+             lm.created_at AS last_time,
+             COALESCE(mc.member_count, 0) AS member_count
+      FROM group_chats gc
+      JOIN group_members gmem ON gmem.group_id = gc.id AND gmem.user_id = ?
+      LEFT JOIN group_messages lm
+        ON lm.id = (
+          SELECT gm2.id
+          FROM group_messages gm2
+          WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0
+          ORDER BY gm2.created_at DESC, gm2.id DESC
+          LIMIT 1
+        )
+      LEFT JOIN (
+        SELECT group_id, COUNT(*) AS member_count FROM group_members GROUP BY group_id
+      ) mc ON mc.group_id = gc.id
+      ORDER BY lm.created_at DESC, gc.name ASC
+    `;
             const [rows] = await db.execute(query, [userId]);
 
             const groups = rows.map(g => {
-                let preview = g.last_text || '';
+                let preview = dec(g.last_text) || '';
                 if (g.last_has_image) preview = '🖼️ Фотография';
                 else if (g.last_has_audio) preview = '🎙️ Голосовое сообщение';
                 else if (g.last_has_file) preview = '📄 Файл';
@@ -340,7 +334,7 @@ module.exports = (io, socket) => {
             console.error('groups:list', err);
             cb?.({ ok: false, error: 'DB_ERROR' });
         }
-    });
+    });;
 
     socket.on('groups:create', async ({ name, memberIds }, cb) => {
         try {
@@ -419,6 +413,7 @@ module.exports = (io, socket) => {
 
             const history = rows.map(m => {
                 m.msg_type = detectMsgType(m);
+                m.text = dec(m.text);
                 return toHistoryPreview(m);
             });
 
@@ -451,7 +446,7 @@ module.exports = (io, socket) => {
             const [result] = await db.execute(
                 `INSERT INTO group_messages (group_id, sender_id, text, image_data, audio_data, file_data, file_name)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [groupId, userId, text || '', image_data, audio_data, file_data, file_name]
+                [groupId, userId, enc(text) || '', image_data, audio_data, file_data, file_name]
             );
 
             const [rows] = await db.execute('SELECT * FROM group_messages WHERE id = ?', [result.insertId]);
@@ -459,6 +454,7 @@ module.exports = (io, socket) => {
                 console.log(`[Голосовое-группа] id=${rows[0].id} группа=${groupId} от=${userId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
             }
             const saved = toBase64(rows[0]);
+            saved.text = dec(saved.text);
             saved.msg_type = msg_type;
 
             io.to(`group_${groupId}`).emit('group:message:new', saved);
@@ -494,7 +490,7 @@ module.exports = (io, socket) => {
         try {
             const [result] = await db.execute(
                 'UPDATE group_messages SET text = ? WHERE id = ? AND sender_id = ?',
-                [text, msgId, userId]
+                [enc(text), msgId, userId]
             );
             if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
 

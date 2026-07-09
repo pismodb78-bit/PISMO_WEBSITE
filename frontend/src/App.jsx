@@ -6,9 +6,10 @@ import RegisterPage from './pages/RegisterPage';
 import Sidebar from './components/Sidebar/Sidebar';
 import ChatWindow from './components/Chat/ChatWindow';
 import { NotificationProvider } from './context/NotificationContext';
+import { CallProvider } from './context/CallContext'; // Импортируем провайдер звонков
+import IncomingCallModal from './components/Chat/Call/IncomingCallModal'; // Путь по структуре Клода
+import CallWindow from './components/Chat/Call/CallWindow'; // Путь по структуре Клода
 import './styles/globals.css';
-
-
 
 const ChatDashboard = ({ user, onLogout }) => {
     const [activeChat, setActiveChat] = useState(() => {
@@ -27,24 +28,31 @@ const ChatDashboard = ({ user, onLogout }) => {
 
     return (
         <NotificationProvider userId={user.id} activeChatId={activeChat?.id}>
-            <div style={{ display: 'flex', height: '100vh', width: '100%', overflow: 'hidden' }}>
-                <Sidebar
-                    user={user}
-                    onLogout={onLogout}
-                    activeChat={activeChat}
-                    onSelectChat={handleSelectChat}
-                    socket={socket}
-                />
+            {/* Оборачиваем в CallProvider, чтобы логика звонков имела доступ к сокету и текущему пользователю */}
+            <CallProvider userId={user.id}>
+                <div style={{ display: 'flex', height: '100vh', width: '100%', overflow: 'hidden' }}>
+                    <Sidebar
+                        user={user}
+                        onLogout={onLogout}
+                        activeChat={activeChat}
+                        onSelectChat={handleSelectChat}
+                        socket={socket}
+                    />
 
-                {activeChat ? (
-                    <ChatWindow activeChat={activeChat} user={user} socket={socket} />
-                ) : (
-                    <div style={{ flex: 1, backgroundColor: 'var(--bg-primary)', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', userSelect: 'none' }}>
-                        <h2 style={{ color: '#fff', marginBottom: '10px' }}>Добро пожаловать в PISMO!</h2>
-                        <p style={{ color: 'var(--text-muted)' }}>Выберите собеседника в левом меню для начала общения.</p>
-                    </div>
-                )}
-            </div>
+                    {activeChat ? (
+                        <ChatWindow activeChat={activeChat} user={user} socket={socket} />
+                    ) : (
+                        <div style={{ flex: 1, backgroundColor: 'var(--bg-primary)', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', userSelect: 'none' }}>
+                            <h2 style={{ color: '#fff', marginBottom: '10px' }}>Добро пожаловать в PISMO!</h2>
+                            <p style={{ color: 'var(--text-muted)' }}>Выберите собеседника в левом меню для начала общения.</p>
+                        </div>
+                    )}
+                </div>
+
+                {/* Глобальные компоненты звонков, которые рендерятся поверх любого экрана */}
+                <IncomingCallModal />
+                <CallWindow />
+            </CallProvider>
         </NotificationProvider>
     );
 };
@@ -62,9 +70,6 @@ function App() {
         setLoading(false);
     }, []);
 
-    // Управление жизненным циклом WebSocket-соединения на клиенте.
-    // Авторизация полностью на handshake (auth: { token }) — отдельный 'join' больше не нужен,
-    // сервер сам кладёт сокет в комнату user_<id> и во все его группы при коннекте.
     useEffect(() => {
         if (user) {
             socket.connect();
