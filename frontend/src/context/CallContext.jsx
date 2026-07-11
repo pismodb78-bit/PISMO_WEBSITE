@@ -16,6 +16,7 @@ export function CallProvider({ children }) {
     const [participants, setParticipants] = useState([]);
     const [micOn, setMicOn] = useState(true);
     const [camOn, setCamOn] = useState(false);
+    const [screenOn, setScreenOn] = useState(false);
     const [connecting, setConnecting] = useState(false);
     const roomRef = useRef(null);
 
@@ -120,6 +121,19 @@ export function CallProvider({ children }) {
         setCamOn(next);
     }, [camOn]);
 
+    const toggleScreenShare = useCallback(async () => {
+        const room = roomRef.current;
+        if (!room) return;
+        const next = !screenOn;
+        try {
+            await room.localParticipant.setScreenShareEnabled(next);
+            setScreenOn(next);
+        } catch (err) {
+            // Пользователь мог отменить системный выбор окна/экрана — не считаем ошибкой
+            console.warn('toggleScreenShare отменён/недоступен:', err?.message);
+        }
+    }, [screenOn]);
+
     useEffect(() => {
         const onIncoming = (p) => setIncomingCall(p);
         socket.on('call:incoming', onIncoming);
@@ -130,7 +144,7 @@ export function CallProvider({ children }) {
     }, []);
 
     return (
-        <CallContext.Provider value={{ incomingCall, activeCall, participants, micOn, camOn, connecting, startCall, acceptCall, declineCall, leaveCall, toggleMic, toggleCam }}>
+        <CallContext.Provider value={{ incomingCall, activeCall, participants, micOn, camOn, screenOn, connecting, startCall, acceptCall, declineCall, leaveCall, toggleMic, toggleCam, toggleScreenShare }}>
             {children}
         </CallContext.Provider>
     );
