@@ -41,6 +41,7 @@ io.on('connection', (socket) => {
     console.log(`[Socket] Подключен user_${socket.userId} (${socket.id})`);
 
     require('./socket/chat')(io, socket);
+    require('./socket/call')(io, socket); // обработчики звонков (call:invite/accept/decline/...)
 
     socket.on('disconnect', () => {
         console.log(`[Socket] Отключен user_${socket.userId} (${socket.id})`);
