@@ -23,12 +23,22 @@ import { FriendsPanel, SettingsModal, NewGroupModal, NewServerModal } from './co
 import * as api from './lib/api';
 import { socket, ask, on } from './lib/socket';
 import { SCOPE, presenceText } from './lib/format';
+import { callBlockReason } from './lib/media';
 
 export default function App() {
     const [me, setMe] = React.useState(api.getStoredUser());
     const [connected, setConnected] = React.useState(false);
     const [connError, setConnError] = React.useState('');
     const [loadError, setLoadError] = React.useState('');
+
+    /**
+     * Сообщение поверх экрана.
+     *
+     * Отдельно от connError намеренно: тот баннер показывается ТОЛЬКО при
+     * оборванной связи, и ошибки звонка, которые складывали туда же,
+     * человек не видел вовсе — связь-то в порядке.
+     */
+    const [notice, setNotice] = React.useState('');
 
     // Где мы сейчас: 'home' (личные) либо id сервера.
     const [place, setPlace] = React.useState('home');
@@ -50,6 +60,12 @@ export default function App() {
     const [callSession, setCallSession] = React.useState(null);
     const [incoming, setIncoming] = React.useState([]);
     const [modal, setModal] = React.useState(null);
+
+    /**
+     * Почему звонки недоступны (или null). Контекст страницы за время
+     * жизни вкладки не меняется, поэтому считаем один раз.
+     */
+    const callsBlocked = React.useMemo(() => callBlockReason(), []);
 
     // ── Подключение ───────────────────────────────────────────────────
 
@@ -272,7 +288,7 @@ export default function App() {
                 : { calleeId: selected.id, hasVideo: withVideo };
             const s = await ask('call:invite', payload);
             setCallSession({ ...s, title: selected.name });
-        } catch (e) { setConnError(e.message); }
+        } catch (e) { setNotice(e.message); }
     }
 
     async function acceptCall(call) {
@@ -280,7 +296,7 @@ export default function App() {
         try {
             const s = await ask('call:accept', { callId: call.callId });
             setCallSession({ ...s, title: call.callerName });
-        } catch (e) { setConnError(e.message); }
+        } catch (e) { setNotice(e.message); }
     }
 
     async function declineCall(call) {
@@ -289,10 +305,16 @@ export default function App() {
     }
 
     async function joinVoice(channel) {
+        // Проверяем до похода на сервер: иначе отметимся в voice_presence,
+        // и на ПК будет видно, что человек «в канале», хотя он не слышен.
+        if (callsBlocked) {
+            setNotice(`${callsBlocked.short}. ${callsBlocked.full}`);
+            return;
+        }
         try {
             const s = await ask('voice:join', { channelId: channel.id });
             setCallSession({ ...s, channelId: channel.id, title: `🔊 ${channel.name}` });
-        } catch (e) { setConnError(e.message); }
+        } catch (e) { setNotice(e.message); }
     }
 
     // ── Выход ─────────────────────────────────────────────────────────
@@ -329,8 +351,22 @@ export default function App() {
                 myLogin={me.login}
                 headerExtra={(
                     <>
-                        <button className="icon-btn" title="Позвонить" onClick={() => startCall(false)}>📞</button>
-                        <button className="icon-btn" title="Видеозвонок" onClick={() => startCall(true)}>📹</button>
+                        <button
+                            className="icon-btn"
+                            title={callsBlocked ? `${callsBlocked.short}. ${callsBlocked.full}` : 'Позвонить'}
+                            style={callsBlocked ? { opacity: .4 } : undefined}
+                            onClick={() => (callsBlocked ? setNotice(`${callsBlocked.short}. ${callsBlocked.full}`) : startCall(false))}
+                        >
+                            📞
+                        </button>
+                        <button
+                            className="icon-btn"
+                            title={callsBlocked ? `${callsBlocked.short}. ${callsBlocked.full}` : 'Видеозвонок'}
+                            style={callsBlocked ? { opacity: .4 } : undefined}
+                            onClick={() => (callsBlocked ? setNotice(`${callsBlocked.short}. ${callsBlocked.full}`) : startCall(true))}
+                        >
+                            📹
+                        </button>
                     </>
                 )}
             />
@@ -346,7 +382,14 @@ export default function App() {
                 meId={me.id}
                 myLogin={me.login}
                 headerExtra={(
-                    <button className="icon-btn" title="Групповой звонок" onClick={() => startCall(false)}>📞</button>
+                    <button
+                        className="icon-btn"
+                        title={callsBlocked ? `${callsBlocked.short}. ${callsBlocked.full}` : 'Групповой звонок'}
+                        style={callsBlocked ? { opacity: .4 } : undefined}
+                        onClick={() => (callsBlocked ? setNotice(`${callsBlocked.short}. ${callsBlocked.full}`) : startCall(false))}
+                    >
+                        📞
+                    </button>
                 )}
             />
         );
@@ -413,6 +456,12 @@ export default function App() {
 
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
                 {!connected && <div className="conn-banner">{connError || 'Подключение…'}</div>}
+                {notice && (
+                    <div className="conn-banner">
+                        {notice}
+                        <button style={{ marginLeft: 10, fontWeight: 700 }} onClick={() => setNotice('')}>✕</button>
+                    </div>
+                )}
                 {connected && loadError && (
                     <div className="conn-banner">
                         {loadError}

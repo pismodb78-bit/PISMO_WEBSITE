@@ -12,6 +12,7 @@
  */
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const { Server } = require('socket.io');
@@ -26,7 +27,40 @@ const livekit = require('./utils/livekit');
 const startedAt = Date.now();
 
 const app = express();
-const server = http.createServer(app);
+
+/**
+ * HTTPS, если заданы SSL_KEY и SSL_CERT.
+ *
+ * ЗАЧЕМ ЭТО ВООБЩЕ НУЖНО. Браузер отдаёт микрофон, камеру и демонстрацию
+ * экрана только в «защищённом контексте»: https либо localhost. На обычном
+ * http по адресу вида 192.168.0.10:5000 объекта navigator.mediaDevices не
+ * существует вовсе, и звонки не начнутся ни при каких разрешениях — в
+ * настройках сайта камера и микрофон показаны серыми, выдать их нельзя.
+ *
+ * ВАЖНО: одного https на сайте мало. Со страницы по https браузер не
+ * пустит соединение на ws:// — это смешанное содержимое. Значит и LiveKit
+ * должен быть за TLS, а LIVEKIT_URL — начинаться с wss://. Иначе один
+ * запрет просто меняется на другой.
+ */
+function createServer() {
+    const keyPath = process.env.SSL_KEY;
+    const certPath = process.env.SSL_CERT;
+    if (!keyPath || !certPath) return { server: http.createServer(app), secure: false };
+
+    try {
+        const options = {
+            key: fs.readFileSync(keyPath),
+            cert: fs.readFileSync(certPath),
+        };
+        return { server: https.createServer(options, app), secure: true };
+    } catch (err) {
+        console.error(`[TLS] не удалось прочитать сертификат: ${err.message}`);
+        console.error('[TLS] поднимаюсь по http — звонки в браузере работать не будут');
+        return { server: http.createServer(app), secure: false };
+    }
+}
+
+const { server, secure } = createServer();
 
 /**
  * CORS. Пустой список origin — режим разработки: отражаем присланный
@@ -210,10 +244,22 @@ io.on('connection', (socket) => {
 });
 
 server.listen(config.port, () => {
+    const scheme = secure ? 'https' : 'http';
     console.log('='.repeat(58));
-    console.log(`  PISMO Web запущен на порту ${config.port}`);
+    console.log(`  PISMO Web запущен: ${scheme}://<адрес>:${config.port}`);
     console.log(`  База:    ${config.db.host}:${config.db.port}/${config.db.database}`);
     console.log(`  LiveKit: ${config.livekit.url}`);
+
+    if (!secure) {
+        console.log('');
+        console.log('  Звонки: браузер даёт микрофон только по https или с localhost.');
+        console.log(`  На этой машине открывайте http://localhost:${config.port} — так они работают.`);
+        console.log('  Для доступа по сети задайте SSL_KEY и SSL_CERT (подробности в README).');
+    } else if (/^ws:\/\//i.test(config.livekit.url)) {
+        console.log('');
+        console.log('  ВНИМАНИЕ: сайт по https, а LIVEKIT_URL по ws:// — браузер такое');
+        console.log('  соединение заблокирует. Адрес LiveKit должен быть wss://.');
+    }
     console.log('='.repeat(58));
 });
 

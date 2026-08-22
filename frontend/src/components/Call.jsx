@@ -2,6 +2,7 @@ import React from 'react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import { socket, ask } from '../lib/socket';
 import { colorFor, initials } from '../lib/format';
+import { callBlockReason, mixedContentRisk } from '../lib/media';
 
 /**
  * Окно звонка. Медиа идёт напрямую в LiveKit, минуя наш бэкенд —
@@ -127,10 +128,21 @@ export default function Call({ session, meId, meName, onClose }) {
                 refresh();
             } catch (err) {
                 if (active) {
-                    setError(
-                        `${err.message}. Проверьте доступ к микрофону; `
-                        + 'если сайт открыт по https, адрес LiveKit должен быть wss://',
-                    );
+                    // Прежде чем показывать текст исключения, объясняем самые
+                    // частые причины: без этого человек видит «reading
+                    // getUserMedia of undefined» и ищет ошибку в коде, хотя
+                    // дело в адресе сайта или в адресе LiveKit.
+                    const blocked = callBlockReason();
+                    if (blocked) {
+                        setError(`${blocked.short}. ${blocked.full}`);
+                    } else if (mixedContentRisk(session.url)) {
+                        setError(
+                            'Страница открыта по https, а LiveKit — по ws://. '
+                            + 'Браузер блокирует такое соединение: адрес LiveKit должен быть wss://.',
+                        );
+                    } else {
+                        setError(err.message);
+                    }
                     setStatus('');
                 }
             }
