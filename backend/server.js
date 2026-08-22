@@ -22,6 +22,7 @@ const config = require('./config');
 const db = require('./db');
 const { socketAuth } = require('./utils/session');
 const presence = require('./data/presence');
+const live = require('./live');
 const livekit = require('./utils/livekit');
 
 const startedAt = Date.now();
@@ -242,6 +243,11 @@ io.on('connection', (socket) => {
         }
     });
 });
+
+// Живая доставка: сообщения с ПК и Android приходят прямо в базу, минуя
+// наш сокет, и без этого опроса появлялись бы на сайте только после
+// перезагрузки страницы. См. live.js.
+live.start(io);
 
 server.listen(config.port, () => {
     const scheme = secure ? 'https' : 'http';

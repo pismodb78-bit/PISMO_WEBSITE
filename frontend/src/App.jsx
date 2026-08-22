@@ -22,8 +22,11 @@ import { FriendsPanel, SettingsModal, NewGroupModal, NewServerModal } from './co
 
 import * as api from './lib/api';
 import { socket, ask, on } from './lib/socket';
-import { SCOPE, presenceText } from './lib/format';
+import { SCOPE, presenceText, describeMessage } from './lib/format';
 import { callBlockReason } from './lib/media';
+import {
+    ensurePermission, notify, sounds, setTitleBadge, windowFocused, canAskPermission,
+} from './lib/notify';
 
 export default function App() {
     const [me, setMe] = React.useState(api.getStoredUser());
@@ -237,13 +240,162 @@ export default function App() {
         return () => clearInterval(t);
     }, [connected, conversations, members]);
 
+    // ── Уведомления ───────────────────────────────────────────────────
+
+    /**
+     * Что сейчас открыто. Нужно, чтобы не звенеть о сообщении, которое
+     * человек и так видит перед собой — ПК и Android ведут себя так же.
+     */
+    const openRef = React.useRef(null);
+    React.useEffect(() => { openRef.current = selected; }, [selected]);
+
+    /**
+     * О каких сообщениях уже звенели.
+     *
+     * Событие message:new приходит дважды, когда пишут через сайт: сразу от
+     * обработчика отправки и следом от опроса базы (он видит ту же строку и
+     * не знает, что её уже разослали). В ленте дубль отсекается по id, а
+     * вот звук и уведомление прозвучали бы оба раза.
+     *
+     * Держим ограниченное окно последних id: список без предела за сутки
+     * работы вырос бы на десятки тысяч записей.
+     */
+    const notified = React.useRef(new Set());
+    const rememberNotified = React.useCallback((key) => {
+        if (notified.current.has(key)) return false;
+        notified.current.add(key);
+        if (notified.current.size > 500) {
+            // Set хранит порядок вставки — выбрасываем самые старые.
+            const extra = notified.current.size - 400;
+            let i = 0;
+            for (const k of notified.current) {
+                if (i++ >= extra) break;
+                notified.current.delete(k);
+            }
+        }
+        return true;
+    }, []);
+
+    /** Разрешение спрашиваем один раз, после входа. */
+    React.useEffect(() => {
+        if (!me) return;
+        if (canAskPermission()) ensurePermission().catch(() => {});
+    }, [me]);
+
+    /** Счётчик непрочитанных в заголовке вкладки — замена мигания окна на ПК. */
+    React.useEffect(() => {
+        const dm = conversations.reduce((n, c) => n + (c.unread || 0), 0);
+        const gr = groups.reduce((n, g) => n + (g.unread || 0), 0);
+        const sv = servers.reduce((n, s) => n + (s.mentions || 0), 0);
+        setTitleBadge(dm + gr + sv);
+    }, [conversations, groups, servers]);
+
+    /**
+     * Уведомление о новом сообщении.
+     *
+     * Молчим в двух случаях: сообщение своё и чат уже открыт на экране, а
+     * вкладка на виду. Во втором случае человек и так его видит, а лишний
+     * звон раздражает — то же правило действует на ПК.
+     */
+    React.useEffect(() => {
+        if (!me) return undefined;
+
+        return on('message:new', ({ scope, peerId, message }) => {
+            if (!message || message.senderId === me.id) return;
+
+            const open = openRef.current;
+            const looking = windowFocused() && open
+                && ((scope === SCOPE.DM && open.kind === 'dm' && open.id === peerId)
+                    || (scope === SCOPE.GROUP && open.kind === 'group' && open.id === peerId)
+                    || (scope === SCOPE.SERVER && open.kind === 'channel' && open.id === peerId));
+            if (looking) return;
+
+            // Канал уведомляет отдельным событием (там ещё упоминания и
+            // заглушённые серверы), поэтому здесь его пропускаем.
+            if (scope === SCOPE.SERVER) return;
+
+            if (!rememberNotified(`m${message.id}`)) return;
+
+            const preview = describeMessage(message);
+            sounds.message();
+            notify({
+                title: scope === SCOPE.GROUP ? `${message.senderName} · группа` : message.senderName,
+                body: preview,
+                tag: `${scope}:${peerId}`,
+                onClick: () => {
+                    if (scope === SCOPE.GROUP) setSelected({ kind: 'group', id: peerId, name: '' });
+                    else setSelected({ kind: 'dm', id: peerId, name: message.senderName });
+                },
+            });
+        });
+    }, [me, rememberNotified]);
+
+    /**
+     * Каналы серверов. Отдельно от message:new: бэкенд уже отсеял
+     * заглушённые серверы и пометил, упомянули ли меня, — на ПК и Android
+     * «упомянули» и «просто новое сообщение» это разные поводы.
+     */
+    React.useEffect(() => {
+        if (!me) return undefined;
+
+        return on('channel:activity', ({ serverId, channelId, channelName, preview, mention }) => {
+            const open = openRef.current;
+            const looking = windowFocused() && open
+                && open.kind === 'channel' && open.id === channelId;
+            if (looking) return;
+
+            // Без упоминания звеним только когда вкладка не на виду:
+            // иначе каждый живой канал превращается в трещотку.
+            if (!mention && windowFocused()) return;
+            if (!rememberNotified(`c${channelId}:${preview}`)) return;
+
+            if (mention) sounds.mention(); else sounds.message();
+            notify({
+                title: mention ? `Вас упомянули в #${channelName}` : `#${channelName}`,
+                body: preview,
+                tag: `channel:${channelId}`,
+                onClick: () => {
+                    setPlace(serverId);
+                    setSelected({ kind: 'channel', id: channelId, name: channelName });
+                },
+            });
+        });
+    }, [me, rememberNotified]);
+
+    /** Заявки в друзья — о них на ПК тоже сообщают. */
+    const knownRequests = React.useRef(null);
+    React.useEffect(() => {
+        if (knownRequests.current === null) { knownRequests.current = friendRequests; return; }
+        if (friendRequests > knownRequests.current) {
+            sounds.message();
+            notify({
+                title: 'Заявка в друзья',
+                body: friendRequests > 1 ? `Заявок: ${friendRequests}` : 'Новая заявка',
+                tag: 'friends',
+                onClick: () => { setPlace('home'); setSelected({ kind: 'friends' }); },
+            });
+        }
+        knownRequests.current = friendRequests;
+    }, [friendRequests]);
+
     // ── Звонки ────────────────────────────────────────────────────────
 
     React.useEffect(() => {
         if (!connected) return undefined;
         const offs = [
             on('call:incoming', (call) => {
-                setIncoming((old) => (old.some((c) => c.callId === call.callId) ? old : [...old, call]));
+                setIncoming((old) => {
+                    if (old.some((c) => c.callId === call.callId)) return old;
+                    // Звеним и показываем шторку только на действительно
+                    // новом вызове, иначе опрос повторял бы это каждый такт.
+                    sounds.call();
+                    notify({
+                        title: `Звонок: ${call.callerName}`,
+                        body: call.groupId ? 'Групповой звонок' : 'Входящий вызов',
+                        tag: `call:${call.callId}`,
+                    });
+                    return [...old, call];
+                });
             }),
             on('call:ended', ({ callId }) => {
                 setIncoming((old) => old.filter((c) => c.callId !== callId));
@@ -254,29 +406,32 @@ export default function App() {
             }),
         ];
 
-        // Опрос входящих: позвонить могут с телефона или ПК, а они о нашем
-        // сокете ничего не знают — просто пишут строку в call_sessions.
+        /**
+         * Подстраховка на случай, если событие потерялось.
+         *
+         * Основной путь теперь другой: бэкенд сам смотрит в call_sessions и
+         * шлёт call:incoming — иначе звонок с ПК или телефона на сайте не
+         * появлялся бы, они о нашем сокете не знают. Поэтому здесь редкий
+         * такт, а не частый: он нужен только чтобы подобрать вызов, который
+         * начался до подключения сокета.
+         */
         const poll = () => {
             ask('call:poll').then((r) => {
-                if (r.calls?.length) {
-                    setIncoming((old) => {
-                        const known = new Set(old.map((c) => c.callId));
-                        const fresh = r.calls
-                            .filter((c) => !known.has(c.id))
-                            .map((c) => ({
-                                callId: c.id,
-                                callerId: c.callerId,
-                                callerName: c.callerName,
-                                groupId: c.groupId,
-                                hasVideo: c.hasVideo,
-                            }));
-                        return fresh.length ? [...old, ...fresh] : old;
-                    });
+                for (const c of r.calls || []) {
+                    // Через тот же обработчик, что и событие: там звук и
+                    // уведомление, и дубли отсекаются по callId.
+                    setIncoming((old) => (old.some((x) => x.callId === c.id) ? old : [...old, {
+                        callId: c.id,
+                        callerId: c.callerId,
+                        callerName: c.callerName,
+                        groupId: c.groupId,
+                        hasVideo: c.hasVideo,
+                    }]));
                 }
             }).catch(() => {});
         };
         poll();
-        const t = setInterval(poll, 4000);
+        const t = setInterval(poll, 15000);
 
         return () => { offs.forEach((off) => off()); clearInterval(t); };
     }, [connected]);
