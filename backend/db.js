@@ -1,51 +1,166 @@
-const fs = require('fs');
-const path = require('path');
+/**
+ * Пул подключений к MySQL `bdauth` — к той же базе, куда напрямую ходят
+ * ПК-клиент (DBHelper.cs) и Android (Db.kt).
+ *
+ * Своего бэкенда у проекта исторически нет: приложения работают с базой
+ * сами. Браузер так не умеет — из веб-страницы нельзя открыть TCP-сокет к
+ * MySQL, — поэтому сайту нужен этот шлюз. Он не «ещё один сервер данных»,
+ * а ровно тот же слой запросов, только вынесенный за пределы страницы.
+ *
+ * Отсюда следует главное правило файла: любой запрос здесь обязан
+ * совпадать с запросом клиента. Расхождение не ломает сборку и не даёт
+ * ошибку — оно проявляется как «на сайте видно не то, что в приложении».
+ */
 const mysql = require('mysql2/promise');
+const config = require('./config');
 
-let pool;
-
-try {
-    // Чтение ip.txt из корня проекта (на уровень выше текущего файла)
-    const ipFilePath = path.join(__dirname, '..', 'ip.txt');
-    
-    if (!fs.existsSync(ipFilePath)) {
-        throw new Error(`Файл конфигурации не найден по пути: ${ipFilePath}`);
-    }
-
-    const content = fs.readFileSync(ipFilePath, 'utf8').trim();
-    
-    // Парсинг строки вида: server=85.174.248.59;port=3307;uid=user1;...
-    const config = {};
-    content.split(';').forEach(pair => {
-        const [key, value] = pair.split('=');
-        if (key && value) {
-            config[key.trim().toLowerCase()] = value.trim();
+const pool = mysql.createPool({
+    host: config.db.host,
+    port: config.db.port,
+    user: config.db.user,
+    password: config.db.password,
+    database: config.db.database,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
+    // Кириллица и эмодзи. utf8mb4 обязателен: реакции хранятся эмодзи, а в
+    // utf8mb4_general_ci разные эмодзи ещё и сравниваются как равные — из-за
+    // этого на ПК тумблер реакции снимал чужую (миграция 9 чинит коллацию).
+    charset: 'utf8mb4',
+    // Вложения лежат в LONGBLOB прямо в таблицах сообщений; без этого
+    // mysql2 отдаёт их строкой и бьёт байты.
+    typeCast(field, next) {
+        if (field.type === 'BLOB' || field.type === 'LONGBLOB'
+            || field.type === 'MEDIUM_BLOB' || field.type === 'TINY_BLOB') {
+            return field.buffer();
         }
-    });
+        return next();
+    },
+    // Времена читаем через UNIX_TIMESTAMP() в самом SQL (как на Android),
+    // чтобы драйвер не вносил сдвиг часовых поясов.
+    dateStrings: true,
+    timezone: 'Z',
+});
 
-    // Проверка обязательных параметров
-    if (!config.server || !config.uid || !config.password || !config.database) {
-        throw new Error('Некорректный формат строки подключения в ip.txt');
-    }
+console.log(`[БД] пул готов: ${config.db.host}:${config.db.port}/${config.db.database}`);
 
-    // Создание пула подключений к MySQL
-    pool = mysql.createPool({
-        host: config.server,
-        port: parseInt(config.port) || 3307,
-        user: config.uid,
-        password: config.password,
-        database: config.database,
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0,
-        enableKeepAlive: true,
-        keepAliveInitialDelay: 10000
-    });
+// ── Хелперы запросов (та же форма, что у Db.kt) ────────────────────────
 
-    console.log(`[БД] Пул подключений успешно инициализирован (${config.server}:${config.port})`);
-} catch (error) {
-    console.error('[Критическая ошибка БД]:', error.message);
-    process.exit(1);
+async function query(sql, params = []) {
+    const [rows] = await pool.query(sql, params);
+    return rows;
 }
 
-module.exports = pool;
+async function queryFirst(sql, params = []) {
+    const rows = await query(sql, params);
+    return rows.length ? rows[0] : null;
+}
+
+/** Возвращает affectedRows. */
+async function exec(sql, params = []) {
+    const [result] = await pool.query(sql, params);
+    return result.affectedRows ?? 0;
+}
+
+/** INSERT с возвратом сгенерированного id (аналог LastInsertedId). */
+async function insert(sql, params = []) {
+    const [result] = await pool.query(sql, params);
+    return result.insertId ?? 0;
+}
+
+async function scalar(sql, params = [], fallback = null) {
+    const row = await queryFirst(sql, params);
+    if (!row) return fallback;
+    const first = Object.values(row)[0];
+    return first === null || first === undefined ? fallback : first;
+}
+
+async function scalarInt(sql, params = [], fallback = 0) {
+    const v = await scalar(sql, params, null);
+    if (v === null) return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+async function exists(sql, params = []) {
+    return (await queryFirst(sql, params)) !== null;
+}
+
+/**
+ * Есть ли колонка. На этом хостинге доступ к information_schema закрыт даже
+ * администратору (#1044) — тот же случай, что описан в ServerRepository.kt,
+ * — поэтому есть фолбэк на SHOW COLUMNS, которому хватает обычных прав.
+ *
+ * Ответ кэшируется: проверка идёт перед каждым запросом сообщений канала, а
+ * схема за время жизни процесса не меняется.
+ */
+const columnCache = new Map();
+
+async function columnExists(table, column) {
+    const key = `${table}.${column}`;
+    if (columnCache.has(key)) return columnCache.get(key);
+
+    let found = false;
+    try {
+        found = await scalarInt(
+            'SELECT COUNT(*) FROM information_schema.COLUMNS '
+            + 'WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?',
+            [table, column],
+        ) > 0;
+    } catch (_) {
+        if (/^[A-Za-z0-9_]+$/.test(table)) {
+            try {
+                const rows = await query(`SHOW COLUMNS FROM \`${table}\``);
+                found = rows.some((r) => String(r.Field).toLowerCase() === column.toLowerCase());
+            } catch (_) {
+                found = false;
+            }
+        }
+    }
+    columnCache.set(key, found);
+    return found;
+}
+
+const tableCache = new Map();
+
+async function tableExists(table) {
+    if (tableCache.has(table)) return tableCache.get(table);
+    let found = false;
+    try {
+        found = await scalarInt(
+            'SELECT COUNT(*) FROM information_schema.TABLES '
+            + 'WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME=?',
+            [table],
+        ) > 0;
+    } catch (_) {
+        try {
+            const rows = await query('SHOW TABLES');
+            found = rows.some((r) => String(Object.values(r)[0]).toLowerCase() === table.toLowerCase());
+        } catch (_) {
+            found = false;
+        }
+    }
+    tableCache.set(table, found);
+    return found;
+}
+
+/** Проверка связи — для /api/health. */
+async function ping() {
+    return scalar('SELECT VERSION()', [], '?');
+}
+
+module.exports = {
+    pool,
+    query,
+    queryFirst,
+    exec,
+    insert,
+    scalar,
+    scalarInt,
+    exists,
+    columnExists,
+    tableExists,
+    ping,
+};

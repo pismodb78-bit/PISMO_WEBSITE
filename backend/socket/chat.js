@@ -1,520 +1,342 @@
+/**
+ * Личные и групповые чаты через сокет.
+ *
+ * Все обработчики отвечают через ack-колбэк {ok:true, ...} либо
+ * {ok:false, error}. Событие «прилетело новое» рассылается в персональные
+ * комнаты `user_<id>`: сокет у человека может быть не один (две вкладки),
+ * и адресовать надо всем его устройствам сразу — та же поправка, что
+ * делали на Android («слать событие на все устройства, а не только
+ * собеседнику»).
+ */
 const db = require('../db');
-const { enc, dec } = require('../utils/crypto');
+const messages = require('../data/messages');
+const social = require('../data/social');
+const reactions = require('../data/reactions');
+const pins = require('../data/pins');
+const { SCOPE, normalizeScope } = require('../data/scopes');
+const { describeMessage, withSender } = require('../utils/format');
+const config = require('../config');
 
-function toBase64(msg) {
-    if (msg.image_data) msg.image_data = msg.image_data.toString('base64');
-    if (msg.audio_data) msg.audio_data = msg.audio_data.toString('base64');
-    if (msg.file_data) msg.file_data = msg.file_data.toString('base64');
-    return msg;
-}
-
-function detectMsgType(msg) {
-    if (msg.image_data) return 'image';
-    if (msg.audio_data) return 'audio';
-    if (msg.file_data) return 'file';
-    return 'text';
-}
-
-// Для истории чата НЕ включаем тяжёлые BLOB-поля целиком — иначе при большом
-// количестве файлов JSON.stringify падает с RangeError: Invalid string length.
-// Вместо данных отдаём только флаги наличия; сами данные подгружаются по требованию
-// через 'message:file' / 'group:message:file', когда сообщение реально рендерится.
-function toHistoryPreview(msg) {
-    const hasImage = !!msg.image_data;
-    const hasAudio = !!msg.audio_data;
-    const hasFile = !!msg.file_data;
-
-    delete msg.image_data;
-    delete msg.audio_data;
-    delete msg.file_data;
-
-    msg.has_image = hasImage;
-    msg.has_audio = hasAudio;
-    msg.has_file = hasFile;
-    return msg;
-}
-
-// Раскладывает входящий base64-файл по нужной колонке (раньше это делал multer)
-function splitIncomingFile(file) {
-    let image_data = null, audio_data = null, file_data = null, file_name = null, msg_type = 'text';
-
-    if (file && file.data) {
-        const buffer = Buffer.from(file.data, 'base64');
-        file_name = file.name || null;
-        const mime = file.mime || '';
-        const lowerName = (file_name || '').toLowerCase();
-
-        if (mime.startsWith('image/') || /\.(jpe?g|png|gif|webp|bmp)$/i.test(lowerName)) {
-            // Иногда браузер не проставляет mime у файла (file.type === '') — тогда
-            // картинка ошибочно уходила как «файл» и рендерилась блоком 📄 с GUID-именем
-            // поверх изображения. Подстраховываемся распознаванием по расширению.
-            msg_type = 'image';
-            image_data = buffer;
-        } else if (
-            mime.startsWith('audio/') ||
-            lowerName.endsWith('.webm') || lowerName.endsWith('.wav') ||
-            lowerName.endsWith('.ogg') || lowerName.endsWith('.mp3') || lowerName.endsWith('.m4a')
-        ) {
-            msg_type = 'audio';
-            audio_data = buffer;
-        } else {
-            msg_type = 'file';
-            file_data = buffer;
-        }
+/** Приводит вложение из браузера к Buffer. */
+function toBuffer(value) {
+    if (!value) return null;
+    if (Buffer.isBuffer(value)) return value;
+    if (value instanceof ArrayBuffer) return Buffer.from(value);
+    if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    if (typeof value === 'string') {
+        // data:URL или голый base64.
+        const comma = value.indexOf(',');
+        const body = value.startsWith('data:') && comma > 0 ? value.slice(comma + 1) : value;
+        return Buffer.from(body, 'base64');
     }
-
-    return { image_data, audio_data, file_data, file_name, msg_type };
+    return null;
 }
 
-module.exports = (io, socket) => {
-    const userId = socket.userId;
+/** Обёртка ack: единый формат ответа и один лог на все ошибки. */
+function reply(cb, promise, label) {
+    if (typeof cb !== 'function') return promise.catch(() => {});
+    return promise
+        .then((data) => cb({ ok: true, ...(data || {}) }))
+        .catch((err) => {
+            console.error(`[сокет:${label}]`, err.message);
+            cb({ ok: false, error: err.message || 'Ошибка' });
+        });
+}
 
-    // ── Автоприсоединение к личной комнате и всем группам пользователя ──
-    socket.join(`user_${userId}`);
-    (async () => {
-        try {
-            const [rows] = await db.execute('SELECT group_id FROM group_members WHERE user_id = ?', [userId]);
-            rows.forEach(r => socket.join(`group_${r.group_id}`));
-        } catch (err) {
-            console.error('Ошибка авто-присоединения к группам:', err);
+/** Догружает реакции и закрепы к странице сообщений — одним запросом на страницу. */
+async function decorate(me, list, scope) {
+    if (!list.length) return list;
+    const ids = list.map((m) => m.id);
+    const [byMessage, pinned] = await Promise.all([
+        reactions.forMessages(me, ids, scope),
+        pins.pinnedIds(scope),
+    ]);
+    for (const m of list) {
+        m.reactions = byMessage.get(m.id) || [];
+        m.isPinned = pinned.has(m.id);
+    }
+    return list;
+}
+
+module.exports = function registerChat(io, socket) {
+    const me = socket.userId;
+
+    // ── Списки ────────────────────────────────────────────────────────
+
+    socket.on('conversations:list', (_p, cb) => reply(cb, (async () => ({
+        conversations: await messages.loadConversations(me),
+    }))(), 'conversations:list'));
+
+    socket.on('groups:list', (_p, cb) => reply(cb, (async () => ({
+        groups: await messages.loadGroups(me),
+    }))(), 'groups:list'));
+
+    socket.on('users:list', (_p, cb) => reply(cb, (async () => ({
+        users: await social.allUsers(me),
+    }))(), 'users:list'));
+
+    // ── История ───────────────────────────────────────────────────────
+
+    socket.on('chat:history', ({ partnerId, beforeId = 0, limit } = {}, cb) => reply(cb, (async () => {
+        const list = await messages.loadDirectMessages(me, partnerId, limit, beforeId);
+        await decorate(me, list, SCOPE.DM);
+        const [blocks, pinnedList] = await Promise.all([
+            messages.blockState(me, partnerId),
+            pins.listDirect(me, partnerId),
+        ]);
+        return { messages: list, blocks, pinned: pinnedList };
+    })(), 'chat:history'));
+
+    socket.on('group:history', ({ groupId, beforeId = 0, limit } = {}, cb) => reply(cb, (async () => {
+        if (!(await social.isGroupMember(groupId, me))) throw new Error('Вы не участник группы');
+        const list = await messages.loadGroupMessages(groupId, limit, beforeId);
+        await decorate(me, list, SCOPE.GROUP);
+        return { messages: list, pinned: await pins.listGroup(groupId) };
+    })(), 'group:history'));
+
+    /** Цитата сообщения, на которое отвечают. */
+    socket.on('message:quote', ({ scope, messageId } = {}, cb) => reply(cb, (async () => ({
+        quote: await messages.loadReplyQuote(messageId, scope),
+    }))(), 'message:quote'));
+
+    // ── Отправка ──────────────────────────────────────────────────────
+
+    socket.on('chat:send', (payload = {}, cb) => reply(cb, (async () => {
+        const { receiverId, text = '', replyToId = 0, fileName = null } = payload;
+        if (!receiverId) throw new Error('Не указан получатель');
+
+        // Блокировки и приватность проверяем на сервере: настройка, которую
+        // соблюдает только интерфейс, не защищает ни от чего.
+        const blocks = await messages.blockState(me, receiverId);
+        if (blocks.blockedMe) throw new Error('Пользователь ограничил вам отправку сообщений');
+        if (blocks.iBlocked) throw new Error('Вы заблокировали этого пользователя');
+        if (!(await social.canWriteTo(me, receiverId))) {
+            throw new Error('Пользователь принимает сообщения только от друзей');
         }
-    })();
 
-    // ════════════════ СПРАВОЧНИКИ ════════════════
+        const image = toBuffer(payload.image);
+        const audio = toBuffer(payload.audio);
+        const video = toBuffer(payload.video);
+        const file = toBuffer(payload.file);
+        if (file && file.length > config.maxUploadBytes) throw new Error('Файл слишком большой');
 
-    socket.on('users:list', async (_payload, cb) => {
-        try {
-            const [users] = await db.execute('SELECT id, login, Name, Surname, role FROM users');
-            cb?.({ ok: true, data: users });
-        } catch (err) {
-            console.error('users:list', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
+        const id = await messages.sendMessage({
+            me, scope: SCOPE.DM, target: receiverId, text, replyToId,
+            image, audio, video, file, fileName,
+        });
+        if (!id) throw new Error('Сообщение не сохранилось');
 
-    // ════════════════ ЛИЧНЫЕ ЧАТЫ ════════════════
+        const saved = {
+            id,
+            senderId: me,
+            senderName: socket.userName,
+            text,
+            createdAtMs: Date.now(),
+            replyToId: replyToId || 0,
+            isDeleted: false,
+            isEdited: false,
+            hasImage: Boolean(image),
+            hasAudio: Boolean(audio),
+            hasVideo: Boolean(video),
+            hasFile: Boolean(file),
+            fileName,
+            scope: SCOPE.DM,
+            isRead: false,
+            reactions: [],
+            isPinned: false,
+        };
 
-    socket.on('conversations:list', async (_payload, cb) => {
-        try {
-            const query = `
-      SELECT
-        partner_id,
-        lm.text AS lastMessage, lm.msg_type AS lastMsgType,
-        (lm.image_data IS NOT NULL) AS lastHasImage,
-        (lm.audio_data IS NOT NULL) AS lastHasAudio,
-        (lm.file_data  IS NOT NULL) AS lastHasFile,
-        lm.created_at AS lastMessageAt,
-        u.unreadCount
-      FROM (
-        SELECT CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END AS partner_id
-        FROM messages WHERE sender_id = ? OR receiver_id = ? GROUP BY partner_id
-      ) p
-      JOIN messages lm
-        ON lm.id = (
-          SELECT m2.id
-          FROM messages m2
-          WHERE (m2.sender_id = ? AND m2.receiver_id = p.partner_id)
-             OR (m2.sender_id = p.partner_id AND m2.receiver_id = ?)
-          ORDER BY m2.created_at DESC, m2.id DESC
-          LIMIT 1
-        )
-      LEFT JOIN (
-        SELECT sender_id AS partner_id, COUNT(*) AS unreadCount
-        FROM messages WHERE receiver_id = ? AND is_read = 0 GROUP BY sender_id
-      ) u ON u.partner_id = p.partner_id
-      ORDER BY lm.created_at DESC
-    `;
-            const params = [userId, userId, userId, userId, userId, userId];
-            const [rows] = await db.execute(query, params);
+        // Себе тоже — у человека может быть открыт сайт в двух вкладках
+        // и телефон рядом.
+        io.to(`user_${receiverId}`).to(`user_${me}`).emit('message:new', {
+            scope: SCOPE.DM, peerId: me, message: saved,
+        });
+        io.to(`user_${receiverId}`).emit('chat:list_update', {
+            partnerId: me,
+            preview: withSender(socket.userName, describeMessage(saved)),
+        });
+        return { message: saved };
+    })(), 'chat:send'));
 
-            const result = rows.map(r => {
-                let preview = dec(r.lastMessage) || '';
-                let type = r.lastMsgType;
-                if (r.lastHasImage) type = 'image';
-                else if (r.lastHasAudio) type = 'audio';
-                else if (r.lastHasFile) type = 'file';
-                if (type === 'image') preview = '🖼️ Фотография';
-                if (type === 'audio') preview = '🎙️ Голосовое сообщение';
-                if (type === 'file') preview = '📄 Файл';
-                return {
-                    id: r.partner_id,
-                    lastMessage: preview,
-                    lastMessageAt: r.lastMessageAt,
-                    unreadCount: r.unreadCount
-                };
+    socket.on('group:send', (payload = {}, cb) => reply(cb, (async () => {
+        const { groupId, text = '', replyToId = 0, fileName = null } = payload;
+        if (!groupId) throw new Error('Не указана группа');
+        if (!(await social.isGroupMember(groupId, me))) throw new Error('Вы не участник группы');
+
+        const image = toBuffer(payload.image);
+        const audio = toBuffer(payload.audio);
+        const video = toBuffer(payload.video);
+        const file = toBuffer(payload.file);
+        if (file && file.length > config.maxUploadBytes) throw new Error('Файл слишком большой');
+
+        const id = await messages.sendMessage({
+            me, scope: SCOPE.GROUP, target: groupId, text, replyToId,
+            image, audio, video, file, fileName,
+        });
+        if (!id) throw new Error('Сообщение не сохранилось');
+
+        const saved = {
+            id, senderId: me, senderName: socket.userName, text,
+            createdAtMs: Date.now(), replyToId: replyToId || 0,
+            isDeleted: false, isEdited: false,
+            hasImage: Boolean(image), hasAudio: Boolean(audio),
+            hasVideo: Boolean(video), hasFile: Boolean(file),
+            fileName, scope: SCOPE.GROUP, isRead: true, reactions: [], isPinned: false,
+        };
+
+        io.to(`group_${groupId}`).emit('message:new', {
+            scope: SCOPE.GROUP, peerId: groupId, message: saved,
+        });
+        // Участникам, которые сейчас не в этой группе на экране, — обновление
+        // списка, чтобы карточка поднялась наверх с непрочитанным.
+        const members = await social.groupMembers(groupId);
+        for (const m of members) {
+            if (m.userId === me) continue;
+            io.to(`user_${m.userId}`).emit('group:list_update', {
+                groupId, preview: withSender(socket.userName, describeMessage(saved)),
             });
-            cb?.({ ok: true, data: result });
-        } catch (err) {
-            console.error('conversations:list', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
         }
+        return { message: saved };
+    })(), 'group:send'));
+
+    // ── Правка, удаление, прочитанное ─────────────────────────────────
+
+    socket.on('message:edit', ({ scope, messageId, text, peerId } = {}, cb) => reply(cb, (async () => {
+        const sc = normalizeScope(scope);
+        const author = await messages.messageAuthor(sc, messageId);
+        if (author !== me) throw new Error('Править можно только свои сообщения');
+
+        await messages.editMessage(sc, messageId, text ?? '');
+        const room = sc === SCOPE.GROUP ? `group_${peerId}` : `user_${peerId}`;
+        io.to(room).to(`user_${me}`).emit('message:edited', {
+            scope: sc, peerId, messageId, text,
+        });
+        return {};
+    })(), 'message:edit'));
+
+    socket.on('message:delete', ({ scope, messageId, peerId } = {}, cb) => reply(cb, (async () => {
+        const sc = normalizeScope(scope);
+        const author = await messages.messageAuthor(sc, messageId);
+        if (author !== me) throw new Error('Удалять можно только свои сообщения');
+
+        await messages.deleteMessage(sc, messageId);
+        const room = sc === SCOPE.GROUP ? `group_${peerId}` : `user_${peerId}`;
+        io.to(room).to(`user_${me}`).emit('message:deleted', { scope: sc, peerId, messageId });
+        return {};
+    })(), 'message:delete'));
+
+    socket.on('message:history', ({ scope, messageId } = {}, cb) => reply(cb, (async () => ({
+        history: await messages.editHistory(scope, messageId),
+    }))(), 'message:history'));
+
+    socket.on('chat:read', ({ partnerId } = {}, cb) => reply(cb, (async () => {
+        await messages.markAsRead(me, partnerId);
+        // Собеседнику — чтобы галочки прочтения обновились сразу.
+        io.to(`user_${partnerId}`).emit('messages:read', { byUserId: me });
+        return {};
+    })(), 'chat:read'));
+
+    socket.on('chat:unread', (_p, cb) => reply(cb, (async () => ({
+        unread: await messages.unreadBySender(me),
+    }))(), 'chat:unread'));
+
+    // ── Реакции и закрепы ─────────────────────────────────────────────
+
+    socket.on('reaction:toggle', ({ scope, messageId, emoji, peerId } = {}, cb) => reply(cb, (async () => {
+        const sc = normalizeScope(scope);
+        const active = await reactions.toggle(me, messageId, sc, emoji);
+        const list = (await reactions.forMessages(me, [messageId], sc)).get(messageId) || [];
+
+        let room = `user_${peerId}`;
+        if (sc === SCOPE.GROUP) room = `group_${peerId}`;
+        if (sc === SCOPE.SERVER) room = `channel_${peerId}`;
+        io.to(room).to(`user_${me}`).emit('reaction:updated', {
+            scope: sc, peerId, messageId, reactions: list,
+        });
+        return { active, reactions: list };
+    })(), 'reaction:toggle'));
+
+    socket.on('pin:toggle', ({ scope, messageId, peerId } = {}, cb) => reply(cb, (async () => {
+        const sc = normalizeScope(scope);
+        const pinned = await pins.toggle(me, messageId, sc);
+        let room = `user_${peerId}`;
+        if (sc === SCOPE.GROUP) room = `group_${peerId}`;
+        if (sc === SCOPE.SERVER) room = `channel_${peerId}`;
+        io.to(room).to(`user_${me}`).emit('pin:updated', { scope: sc, peerId, messageId, pinned });
+        return { pinned };
+    })(), 'pin:toggle'));
+
+    // ── Печатает… ─────────────────────────────────────────────────────
+
+    socket.on('typing', ({ scope, peerId, typing } = {}) => {
+        const sc = normalizeScope(scope);
+        const room = sc === SCOPE.GROUP ? `group_${peerId}` : `user_${peerId}`;
+        socket.to(room).emit('typing', {
+            scope: sc, peerId: sc === SCOPE.GROUP ? peerId : me,
+            userId: me, userName: socket.userName, typing: Boolean(typing),
+        });
     });
 
-    socket.on('chat:join', async ({ partnerId }, cb) => {
-        try {
-            socket.join(`chat_${partnerId}`);
+    // ── Блокировки ────────────────────────────────────────────────────
 
-            const [rows] = await db.execute(
-                `SELECT id, sender_id, receiver_id, text, image_data, audio_data, file_data, file_name, msg_type, created_at, is_read
-         FROM messages
-         WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
-         ORDER BY created_at ASC`,
-                [userId, partnerId, partnerId, userId]
-            );
+    socket.on('user:block', ({ userId, blocked } = {}, cb) => reply(cb, (async () => {
+        if (blocked) await messages.block(me, userId);
+        else await messages.unblock(me, userId);
+        return { blocked: Boolean(blocked) };
+    })(), 'user:block'));
 
-            const history = rows.map(m => {
-                const detected = detectMsgType(m);
-                m.msg_type = detected !== 'text' ? detected : (m.msg_type || 'text');
-                m.text = dec(m.text);
-                return toHistoryPreview(m);
-            });
+    // ── Группы ────────────────────────────────────────────────────────
 
-            await db.execute(
-                'UPDATE messages SET is_read = 1 WHERE sender_id = ? AND receiver_id = ? AND is_read = 0',
-                [partnerId, userId]
-            );
-            socket.to(`chat_${userId}`).emit('messages:marked_read', { chatId: userId, userId });
+    socket.on('group:create', ({ name, memberIds = [] } = {}, cb) => reply(cb, (async () => {
+        const title = String(name || '').trim();
+        if (!title) throw new Error('Укажите название группы');
+        const groupId = await social.createGroup(me, title, memberIds);
+        if (!groupId) throw new Error('Группа не создалась');
 
-            cb?.({ ok: true, history });
-        } catch (err) {
-            console.error('chat:join', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
+        for (const uid of [me, ...memberIds]) {
+            io.to(`user_${uid}`).emit('group:created', { id: groupId, name: title });
         }
-    });
+        return { groupId };
+    })(), 'group:create'));
 
-    socket.on('chat:leave', ({ partnerId }) => {
-        socket.leave(`chat_${partnerId}`);
-    });
+    socket.on('group:members', ({ groupId } = {}, cb) => reply(cb, (async () => ({
+        members: await social.groupMembers(groupId),
+    }))(), 'group:members'));
 
-    // Подгрузка файла конкретного личного сообщения по требованию
-    socket.on('message:file', async ({ msgId }, cb) => {
-        try {
-            const [rows] = await db.execute(
-                'SELECT image_data, audio_data, file_data, file_name FROM messages WHERE id = ?',
-                [msgId]
-            );
-            if (!rows.length) return cb?.({ ok: false, error: 'NOT_FOUND' });
-            cb?.({ ok: true, ...toBase64(rows[0]) });
-        } catch (err) {
-            console.error('message:file', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
+    socket.on('group:add', ({ groupId, userIds = [] } = {}, cb) => reply(cb, (async () => {
+        if (!(await social.isGroupMember(groupId, me))) throw new Error('Вы не участник группы');
+        const added = await social.addGroupMembers(groupId, userIds);
+        for (const uid of userIds) io.to(`user_${uid}`).emit('group:created', { id: groupId });
+        io.to(`group_${groupId}`).emit('group:members_changed', { groupId });
+        return { added };
+    })(), 'group:add'));
+
+    socket.on('group:leave', ({ groupId } = {}, cb) => reply(cb, (async () => {
+        await social.removeGroupMember(groupId, me);
+        socket.leave(`group_${groupId}`);
+        io.to(`group_${groupId}`).emit('group:members_changed', { groupId });
+        return {};
+    })(), 'group:leave'));
+
+    socket.on('group:remove', ({ groupId, userId } = {}, cb) => reply(cb, (async () => {
+        // Исключать может создатель группы либо системный администратор.
+        const creator = await social.groupCreator(groupId);
+        if (creator !== me && socket.userRole !== 'admin') {
+            throw new Error('Недостаточно прав');
         }
+        await social.removeGroupMember(groupId, userId);
+        io.to(`group_${groupId}`).emit('group:members_changed', { groupId });
+        io.to(`user_${userId}`).emit('group:removed', { groupId });
+        return {};
+    })(), 'group:remove'));
+
+    /** Вход в комнату группы — чтобы получать её события. */
+    socket.on('group:join_room', async ({ groupId } = {}, cb) => {
+        if (await social.isGroupMember(groupId, me)) socket.join(`group_${groupId}`);
+        if (typeof cb === 'function') cb({ ok: true });
     });
 
-    socket.on('chat:send', async ({ receiverId, text, file }, cb) => {
-        try {
-            const { image_data, audio_data, file_data, file_name, msg_type } = splitIncomingFile(file);
-
-            const [result] = await db.execute(
-                `INSERT INTO messages (sender_id, receiver_id, text, image_data, audio_data, file_data, file_name, msg_type)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [userId, receiverId, enc(text) || null, image_data, audio_data, file_data, file_name, msg_type]
-            );
-
-            const [rows] = await db.execute('SELECT * FROM messages WHERE id = ?', [result.insertId]);
-            // Диагностика голосовых: получено vs реально в БД. Если "в БД" меньше —
-            // колонку audio_data режет обычный BLOB (64 КБ), нужен LONGBLOB.
-            if (msg_type === 'audio') {
-                console.log(`[Голосовое] id=${rows[0].id} ${userId}→${receiverId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
-            }
-            const saved = toBase64(rows[0]);
-            saved.text = dec(saved.text);
-
-            io.to(`chat_${receiverId}`).to(`chat_${userId}`).emit('message:new', saved);
-
-            let preview = saved.text || '';
-            if (msg_type === 'image') preview = '🖼️ Фотография';
-            if (msg_type === 'audio') preview = '🎙️ Голосовое сообщение';
-            if (msg_type === 'file') preview = '📄 Файл';
-
-            io.to(`user_${receiverId}`).emit('chat:list_update', {
-                chatId: userId,
-                partnerId: userId,
-                messageId: saved.id,
-                lastMessage: preview,
-                senderId: userId,
-                timestamp: saved.created_at,
-                unread: true
-            });
-
-            cb?.({ ok: true, message: saved });
-        } catch (err) {
-            console.error('chat:send', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('chat:edit', async ({ chatId, msgId, text }, cb) => {
-        try {
-            const [result] = await db.execute(
-                'UPDATE messages SET text = ? WHERE id = ? AND sender_id = ?',
-                [enc(text), msgId, userId]
-            );
-            if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
-
-            io.to(`chat_${chatId}`).to(`chat_${userId}`).emit('message:edit', { id: msgId, text });
-            cb?.({ ok: true });
-        } catch (err) {
-            console.error('chat:edit', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('chat:delete', async ({ chatId, msgId }, cb) => {
-        try {
-            const [result] = await db.execute(
-                'DELETE FROM messages WHERE id = ? AND sender_id = ?',
-                [msgId, userId]
-            );
-            if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
-
-            io.to(`chat_${chatId}`).to(`chat_${userId}`).emit('message:delete', { id: msgId });
-            cb?.({ ok: true });
-        } catch (err) {
-            console.error('chat:delete', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('typing:start', ({ chatId }) => {
-        socket.to(`chat_${chatId}`).emit('typing', { userId, typing: true });
-    });
-
-    socket.on('typing:stop', ({ chatId }) => {
-        socket.to(`chat_${chatId}`).emit('typing', { userId, typing: false });
-    });
-
-    // ════════════════ ГРУППОВЫЕ ЧАТЫ ════════════════
-
-    socket.on('groups:list', async (_payload, cb) => {
-        try {
-            const query = `
-      SELECT gc.id, gc.name, gc.avatar_color,
-             lm.text AS last_text,
-             (lm.image_data IS NOT NULL) AS last_has_image,
-             (lm.audio_data IS NOT NULL) AS last_has_audio,
-             (lm.file_data  IS NOT NULL) AS last_has_file,
-             lm.created_at AS last_time,
-             COALESCE(mc.member_count, 0) AS member_count
-      FROM group_chats gc
-      JOIN group_members gmem ON gmem.group_id = gc.id AND gmem.user_id = ?
-      LEFT JOIN group_messages lm
-        ON lm.id = (
-          SELECT gm2.id
-          FROM group_messages gm2
-          WHERE gm2.group_id = gc.id AND gm2.is_deleted = 0
-          ORDER BY gm2.created_at DESC, gm2.id DESC
-          LIMIT 1
-        )
-      LEFT JOIN (
-        SELECT group_id, COUNT(*) AS member_count FROM group_members GROUP BY group_id
-      ) mc ON mc.group_id = gc.id
-      ORDER BY lm.created_at DESC, gc.name ASC
-    `;
-            const [rows] = await db.execute(query, [userId]);
-
-            const groups = rows.map(g => {
-                let preview = dec(g.last_text) || '';
-                if (g.last_has_image) preview = '🖼️ Фотография';
-                else if (g.last_has_audio) preview = '🎙️ Голосовое сообщение';
-                else if (g.last_has_file) preview = '📄 Файл';
-
-                return {
-                    id: g.id,
-                    name: g.name,
-                    isGroup: true,
-                    avatarColor: g.avatar_color || '#5865F2',
-                    lastMessage: preview,
-                    lastMessageAt: g.last_time,
-                    memberCount: g.member_count
-                };
-            });
-            cb?.({ ok: true, data: groups });
-        } catch (err) {
-            console.error('groups:list', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });;
-
-    socket.on('groups:create', async ({ name, memberIds }, cb) => {
-        try {
-            if (!name || !name.trim()) return cb?.({ ok: false, error: 'NAME_REQUIRED' });
-
-            const [result] = await db.execute(
-                'INSERT INTO group_chats (name, created_by) VALUES (?, ?)',
-                [name.trim(), userId]
-            );
-            const groupId = result.insertId;
-
-            await db.execute(
-                'INSERT INTO group_members (group_id, user_id, is_admin) VALUES (?, ?, 1)',
-                [groupId, userId]
-            );
-
-            const ids = Array.isArray(memberIds) ? memberIds.filter(id => Number(id) !== Number(userId)) : [];
-            for (const uid of ids) {
-                await db.execute(
-                    'INSERT INTO group_members (group_id, user_id, is_admin) VALUES (?, ?, 0)',
-                    [groupId, uid]
-                );
-                io.in(`user_${uid}`).socketsJoin(`group_${groupId}`);
-            }
-            socket.join(`group_${groupId}`);
-
-            io.to(`group_${groupId}`).emit('group:created', { id: groupId, name: name.trim() });
-            cb?.({ ok: true, id: groupId, name: name.trim() });
-        } catch (err) {
-            console.error('groups:create', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('group:members', async ({ groupId }, cb) => {
-        try {
-            const [rows] = await db.execute(
-                `SELECT u.id, u.login, u.Name, u.Surname, gmem.is_admin
-         FROM group_members gmem JOIN users u ON u.id = gmem.user_id
-         WHERE gmem.group_id = ? ORDER BY gmem.is_admin DESC, u.Name ASC`,
-                [groupId]
-            );
-            cb?.({ ok: true, members: rows });
-        } catch (err) {
-            console.error('group:members', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('group:leave_membership', async ({ groupId }, cb) => {
-        try {
-            await db.execute('DELETE FROM group_members WHERE group_id = ? AND user_id = ?', [groupId, userId]);
-            socket.leave(`group_${groupId}`);
-            io.to(`group_${groupId}`).emit('group:member_left', { groupId, userId });
-            cb?.({ ok: true });
-        } catch (err) {
-            console.error('group:leave_membership', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('group:join', async ({ groupId }, cb) => {
-        try {
-            socket.join(`group_${groupId}`);
-
-            const [rows] = await db.execute(
-                `SELECT gm.id, gm.group_id, gm.sender_id, gm.text, gm.image_data, gm.audio_data,
-                gm.file_data, gm.file_name, gm.created_at,
-                u.login AS sender_login, u.Name AS sender_name
-         FROM group_messages gm
-         JOIN users u ON u.id = gm.sender_id
-         WHERE gm.group_id = ?
-         ORDER BY gm.created_at ASC`,
-                [groupId]
-            );
-
-            const history = rows.map(m => {
-                m.msg_type = detectMsgType(m);
-                m.text = dec(m.text);
-                return toHistoryPreview(m);
-            });
-
-            cb?.({ ok: true, history });
-        } catch (err) {
-            console.error('group:join', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    // Подгрузка файла конкретного группового сообщения по требованию
-    socket.on('group:message:file', async ({ msgId }, cb) => {
-        try {
-            const [rows] = await db.execute(
-                'SELECT image_data, audio_data, file_data, file_name FROM group_messages WHERE id = ?',
-                [msgId]
-            );
-            if (!rows.length) return cb?.({ ok: false, error: 'NOT_FOUND' });
-            cb?.({ ok: true, ...toBase64(rows[0]) });
-        } catch (err) {
-            console.error('group:message:file', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('group:send', async ({ groupId, text, file }, cb) => {
-        try {
-            const { image_data, audio_data, file_data, file_name, msg_type } = splitIncomingFile(file);
-
-            const [result] = await db.execute(
-                `INSERT INTO group_messages (group_id, sender_id, text, image_data, audio_data, file_data, file_name)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [groupId, userId, enc(text) || '', image_data, audio_data, file_data, file_name]
-            );
-
-            const [rows] = await db.execute('SELECT * FROM group_messages WHERE id = ?', [result.insertId]);
-            if (msg_type === 'audio') {
-                console.log(`[Голосовое-группа] id=${rows[0].id} группа=${groupId} от=${userId}: получено ${audio_data ? audio_data.length : 0} Б, в БД ${rows[0].audio_data ? rows[0].audio_data.length : 0} Б`);
-            }
-            const saved = toBase64(rows[0]);
-            saved.text = dec(saved.text);
-            saved.msg_type = msg_type;
-
-            io.to(`group_${groupId}`).emit('group:message:new', saved);
-
-            let preview = saved.text || '';
-            if (msg_type === 'image') preview = '🖼️ Фотография';
-            if (msg_type === 'audio') preview = '🎙️ Голосовое сообщение';
-            if (msg_type === 'file') preview = '📄 Файл';
-
-            const [members] = await db.execute(
-                'SELECT user_id FROM group_members WHERE group_id = ? AND user_id != ?',
-                [groupId, userId]
-            );
-            members.forEach(m => {
-                io.to(`user_${m.user_id}`).emit('group:list_update', {
-                    groupId: Number(groupId),
-                    messageId: saved.id,
-                    lastMessage: preview,
-                    senderId: userId,
-                    timestamp: saved.created_at,
-                    unread: true
-                });
-            });
-
-            cb?.({ ok: true, message: saved });
-        } catch (err) {
-            console.error('group:send', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('group:edit', async ({ groupId, msgId, text }, cb) => {
-        try {
-            const [result] = await db.execute(
-                'UPDATE group_messages SET text = ? WHERE id = ? AND sender_id = ?',
-                [enc(text), msgId, userId]
-            );
-            if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
-
-            io.to(`group_${groupId}`).emit('group:message:updated', { msgId, text });
-            cb?.({ ok: true });
-        } catch (err) {
-            console.error('group:edit', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
-    });
-
-    socket.on('group:delete', async ({ groupId, msgId }, cb) => {
-        try {
-            const [result] = await db.execute(
-                'DELETE FROM group_messages WHERE id = ? AND sender_id = ?',
-                [msgId, userId]
-            );
-            if (result.affectedRows === 0) return cb?.({ ok: false, error: 'NOT_FOUND_OR_FORBIDDEN' });
-
-            io.to(`group_${groupId}`).emit('group:message:deleted', { msgId });
-            cb?.({ ok: true });
-        } catch (err) {
-            console.error('group:delete', err);
-            cb?.({ ok: false, error: 'DB_ERROR' });
-        }
+    socket.on('group:leave_room', ({ groupId } = {}) => {
+        socket.leave(`group_${groupId}`);
     });
 };
