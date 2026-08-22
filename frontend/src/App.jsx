@@ -3,13 +3,19 @@ import './styles/globals.css';
 
 import Auth from './components/Auth';
 import Conversation from './components/Conversation';
-// Звонки тянут за собой SDK LiveKit — полмегабайта, которые при открытии
-// переписки не нужны. Грузим их только когда звонок действительно начался.
-const Call = React.lazy(() => import('./components/Call'));
-const IncomingCall = React.lazy(() => import('./components/Call').then(
-    (m) => ({ default: m.IncomingCall }),
-));
+import IncomingCall from './components/IncomingCall';
+import ErrorBoundary from './components/ErrorBoundary';
 import ServerSettings from './components/ServerSettings';
+
+// Окно звонка тянет за собой SDK LiveKit — полмегабайта, которые при
+// открытии переписки не нужны. Грузим его, только когда звонок начался.
+//
+// Плашка входящего вызова СЮДА НЕ ВХОДИТ намеренно: ей SDK не нужен, а
+// раньше она грузилась отсюда же и роняла всё приложение, пока SDK не
+// загрузился или не был установлен. Опрос идёт раз в четыре секунды, так
+// что хватало одной строки ringing в call_sessions, чтобы сайт погас
+// через несколько секунд после входа.
+const Call = React.lazy(() => import('./components/Call'));
 import { Avatar, Empty } from './components/Common';
 import { ServerRail, ChatList, ChannelList, MembersPanel } from './components/Sidebars';
 import { FriendsPanel, SettingsModal, NewGroupModal, NewServerModal } from './components/Panels';
@@ -22,6 +28,7 @@ export default function App() {
     const [me, setMe] = React.useState(api.getStoredUser());
     const [connected, setConnected] = React.useState(false);
     const [connError, setConnError] = React.useState('');
+    const [loadError, setLoadError] = React.useState('');
 
     // Где мы сейчас: 'home' (личные) либо id сервера.
     const [place, setPlace] = React.useState('home');
@@ -70,22 +77,41 @@ export default function App() {
 
     // ── Загрузка списков ──────────────────────────────────────────────
 
+    /**
+     * Ошибку запроса ПОКАЗЫВАЕМ, а не проглатываем.
+     *
+     * Раньше все загрузки заканчивались на `.catch(() => {})`, и упавший
+     * запрос давал пустой экран без единого слова о причине: «зашёл, а
+     * содержимого нет». Отличить сломанный запрос от честно пустого списка
+     * было невозможно ни человеку, ни по логам.
+     */
+    const report = React.useCallback((what) => (err) => {
+        console.error(`[PISMO] ${what}:`, err);
+        setLoadError(`Не удалось загрузить: ${what}. ${err.message || ''}`.trim());
+    }, []);
+
     const loadHome = React.useCallback(() => {
         ask('conversations:list').then((r) => {
             setConversations(r.conversations || []);
+            setLoadError('');
             const ids = (r.conversations || []).map((c) => c.userId);
             if (ids.length) {
+                // Присутствие — украшение: его падение не повод пугать человека.
                 ask('presence:for', { userIds: ids })
                     .then((p) => setPresence(p.presence || {})).catch(() => {});
             }
-        }).catch(() => {});
-        ask('groups:list').then((r) => setGroups(r.groups || [])).catch(() => {});
-        ask('friends:list').then((r) => setFriendRequests((r.incoming || []).length)).catch(() => {});
-    }, []);
+        }).catch(report('список диалогов'));
+
+        ask('groups:list').then((r) => setGroups(r.groups || []))
+            .catch(report('список групп'));
+        ask('friends:list').then((r) => setFriendRequests((r.incoming || []).length))
+            .catch(report('друзья'));
+    }, [report]);
 
     const loadServers = React.useCallback(() => {
-        ask('servers:list').then((r) => setServers(r.servers || [])).catch(() => {});
-    }, []);
+        ask('servers:list').then((r) => setServers(r.servers || []))
+            .catch(report('список серверов'));
+    }, [report]);
 
     React.useEffect(() => {
         if (!connected) return;
@@ -105,13 +131,13 @@ export default function App() {
             const firstText = (r.channels || []).find((c) => c.type !== 'voice');
             if (firstText) setSelected({ kind: 'channel', id: firstText.id, name: firstText.name });
             else setSelected(null);
-        }).catch((e) => setConnError(e.message));
+        }).catch(report('сведения о сервере'));
 
         ask('server:members', { serverId }).then((r) => {
             setMembers(r.members || []);
             setPresence((old) => ({ ...old, ...(r.presence || {}) }));
-        }).catch(() => {});
-    }, []);
+        }).catch(report('участники сервера'));
+    }, [report]);
 
     React.useEffect(() => {
         if (!connected) return;
@@ -387,6 +413,17 @@ export default function App() {
 
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
                 {!connected && <div className="conn-banner">{connError || 'Подключение…'}</div>}
+                {connected && loadError && (
+                    <div className="conn-banner">
+                        {loadError}
+                        <button
+                            style={{ marginLeft: 10, textDecoration: 'underline' }}
+                            onClick={() => { setLoadError(''); loadHome(); loadServers(); }}
+                        >
+                            Повторить
+                        </button>
+                    </div>
+                )}
                 <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
                     {main}
                     {place !== 'home' && members.length > 0 && (
@@ -410,25 +447,33 @@ export default function App() {
                 <button className="icon-btn" title="Выйти" onClick={logout}>⏻</button>
             </div>
 
-            <React.Suspense fallback={null}>
-                {callSession && (
-                    <Call
-                        session={callSession}
-                        meId={me.id}
-                        meName={me.name}
-                        onClose={() => setCallSession(null)}
-                    />
-                )}
+            {/*
+              * Звонок — в своей границе и своём Suspense. Если SDK не
+              * загрузится, погаснет только окно звонка: переписка, серверы
+              * и списки останутся на месте.
+              */}
+            <ErrorBoundary fallback={null}>
+                <React.Suspense fallback={null}>
+                    {callSession && (
+                        <Call
+                            session={callSession}
+                            meId={me.id}
+                            meName={me.name}
+                            onClose={() => setCallSession(null)}
+                        />
+                    )}
+                </React.Suspense>
+            </ErrorBoundary>
 
-                {incoming.map((call) => (
-                    <IncomingCall
-                        key={call.callId}
-                        call={call}
-                        onAccept={acceptCall}
-                        onDecline={declineCall}
-                    />
-                ))}
-            </React.Suspense>
+            {/* Плашке входящего SDK не нужен — она рисуется всегда. */}
+            {incoming.map((call) => (
+                <IncomingCall
+                    key={call.callId}
+                    call={call}
+                    onAccept={acceptCall}
+                    onDecline={declineCall}
+                />
+            ))}
 
             {modal === 'settings' && (
                 <SettingsModal

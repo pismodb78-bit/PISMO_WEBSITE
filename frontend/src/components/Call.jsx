@@ -250,29 +250,3 @@ export default function Call({ session, meId, meName, onClose }) {
         </div>
     );
 }
-
-/** Плашка входящего вызова. */
-export function IncomingCall({ call, onAccept, onDecline }) {
-    return (
-        <div className="incoming">
-            <div className="row">
-                <div className="avatar" style={{ background: colorFor(call.callerName) }}>
-                    {initials(call.callerName)}
-                </div>
-                <div style={{ minWidth: 0 }}>
-                    <div style={{ fontWeight: 600 }}>{call.callerName}</div>
-                    <div className="faint" style={{ fontSize: 12 }}>
-                        {call.groupId ? 'Групповой звонок' : 'Входящий звонок'}
-                        {call.hasVideo ? ' · видео' : ''}
-                    </div>
-                </div>
-            </div>
-            <div className="row" style={{ marginTop: 14 }}>
-                <button className="btn" style={{ flex: 1 }} onClick={() => onAccept(call)}>Принять</button>
-                <button className="btn btn-danger" style={{ flex: 1 }} onClick={() => onDecline(call)}>
-                    Отклонить
-                </button>
-            </div>
-        </div>
-    );
-}
