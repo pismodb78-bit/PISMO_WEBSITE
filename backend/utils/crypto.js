@@ -33,8 +33,21 @@ const KEY = crypto
     .update('PISMO::message::secret::v1::do-not-change', 'utf8')
     .digest();
 
+/**
+ * Драйвер может отдать текстовую колонку буфером — так уже случалось и
+ * стоило сайту работоспособности (см. комментарий про typeCast в db.js).
+ * Приводим к строке на входе: буфер, ушедший дальше по коду, превращается
+ * в браузере в ArrayBuffer и роняет отрисовку.
+ */
+function asText(value) {
+    if (Buffer.isBuffer(value)) return value.toString('utf8');
+    if (value instanceof Uint8Array) return Buffer.from(value).toString('utf8');
+    return value;
+}
+
 /** Шифрует текст в формат ПК-версии. Пустая строка не трогается. */
-function enc(plain) {
+function enc(plainRaw) {
+    const plain = asText(plainRaw);
     if (plain === null || plain === undefined || plain === '') return plain ?? '';
     try {
         const nonce = crypto.randomBytes(NONCE_LEN);
@@ -54,9 +67,15 @@ function enc(plain) {
     }
 }
 
-/** Расшифровывает, если текст зашифрован; иначе возвращает как есть. */
-function dec(stored) {
-    if (!stored || typeof stored !== 'string') return stored ?? '';
+/**
+ * Расшифровывает, если текст зашифрован; иначе возвращает как есть.
+ * Возвращает ВСЕГДА строку — вызывающий код отдаёт результат в браузер.
+ */
+function dec(storedRaw) {
+    const stored = asText(storedRaw);
+    if (stored === null || stored === undefined) return '';
+    if (typeof stored !== 'string') return String(stored);
+    if (stored === '') return '';
 
     if (stored.startsWith(PREFIX_V2)) {
         try {
@@ -95,4 +114,4 @@ function dec(stored) {
     return stored;
 }
 
-module.exports = { enc, dec, PREFIX_V1, PREFIX_V2 };
+module.exports = { enc, dec, asText, PREFIX_V1, PREFIX_V2 };

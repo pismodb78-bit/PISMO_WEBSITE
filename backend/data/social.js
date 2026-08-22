@@ -4,6 +4,7 @@
  */
 const db = require('../db');
 const { buildName } = require('../utils/format');
+const { asText } = require('../utils/crypto');
 
 // ════════════════════════════════════════════════════════════════════
 //  ДРУЗЬЯ
@@ -170,13 +171,16 @@ async function profile(userId) {
         'SELECT Name, Surname, login, about, social_links FROM users WHERE id=?', [userId],
     ).catch(async () => db.queryFirst('SELECT Name, Surname, login FROM users WHERE id=?', [userId]));
     if (!row) return null;
+    // about и social_links на части схем объявлены как TEXT, а такие
+    // колонки драйвер при неудачной настройке отдаёт буфером — в браузере
+    // он превращается в ArrayBuffer и роняет отрисовку. Приводим явно.
     return {
         id: userId,
-        name: row.Name || '',
-        surname: row.Surname || '',
-        login: row.login || '',
-        about: row.about || '',
-        socialLinks: row.social_links || '',
+        name: asText(row.Name) || '',
+        surname: asText(row.Surname) || '',
+        login: asText(row.login) || '',
+        about: asText(row.about) || '',
+        socialLinks: asText(row.social_links) || '',
         displayName: buildName(row.Name, row.Surname, row.login),
     };
 }

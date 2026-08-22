@@ -189,3 +189,46 @@ test('отображаемое имя собирается как buildName', ()
     assert.strictEqual(format.buildName('', '', 'ppetrov'), 'ppetrov');
     assert.strictEqual(format.buildName('Пётр', '', 'p'), 'Пётр');
 });
+
+// ── Текст из базы всегда доходит строкой ───────────────────────────────
+
+test('dec принимает буфер и всегда отдаёт строку', () => {
+    // ЭТО ЛЕЧИТ ПАДЕНИЕ САЙТА НА СПИСКЕ ДИАЛОГОВ. В протоколе MySQL у TEXT
+    // и BLOB один код типа, и колонка с текстом сообщения может приехать
+    // буфером. Буфер, ушедший дальше, socket.io отдаёт в браузер как
+    // ArrayBuffer, а React на нём падает с «Objects are not valid as a
+    // React child» — экран гаснет целиком.
+    const src = 'Привет 👋 ёжик';
+
+    assert.strictEqual(dec(Buffer.from(src, 'utf8')), src, 'открытый текст буфером');
+    assert.strictEqual(dec(Buffer.from(enc(src), 'utf8')), src, 'шифртекст буфером');
+    assert.strictEqual(dec(new Uint8Array(Buffer.from(src, 'utf8'))), src, 'Uint8Array');
+
+    for (const value of [null, undefined, 123, Buffer.from('x')]) {
+        assert.strictEqual(typeof dec(value), 'string', `dec(${String(value)}) обязан вернуть строку`);
+    }
+});
+
+test('enc принимает буфер и шифрует его содержимое, а не «[object Object]»', () => {
+    const src = 'текст из базы';
+    assert.strictEqual(dec(enc(Buffer.from(src, 'utf8'))), src);
+});
+
+test('пул не переопределяет разбор типов — иначе TEXT приедет буфером', () => {
+    // Своя обработка типов здесь запрещена: mysql2 по умолчанию решает по
+    // кодировке колонки (двоичная — буфер, любая другая — строка), и это
+    // единственный способ не спутать TEXT с BLOB. Собственный typeCast по
+    // имени типа ловил и то и другое.
+    const db = require('../db');
+    // PromisePool оборачивает обычный Pool; конфиг лежит на внутреннем.
+    const core = db.pool.pool || db.pool;
+    const cast = core.config && core.config.connectionConfig
+        ? core.config.connectionConfig.typeCast
+        : undefined;
+    // true = штатный разбор mysql2 (по кодировке). Функция = своя обработка,
+    // а именно она и путала TEXT с BLOB.
+    assert.notStrictEqual(
+        typeof cast, 'function',
+        'своя обработка типов запрещена: она отдаёт TEXT буфером',
+    );
+});
