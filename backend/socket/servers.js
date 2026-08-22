@@ -8,6 +8,7 @@
  * поэтому каждое действие сверяется с ServerPermissions заново.
  */
 const servers = require('../data/servers');
+const { toWire } = require('../utils/wire');
 const presence = require('../data/presence');
 const pins = require('../data/pins');
 const reactions = require('../data/reactions');
@@ -17,7 +18,9 @@ const { SCOPE } = require('../data/scopes');
 function reply(cb, promise, label) {
     if (typeof cb !== 'function') return promise.catch(() => {});
     return promise
-        .then((data) => cb({ ok: true, ...(data || {}) }))
+        // toWire: наружу не должен уйти ни один буфер — в браузере он
+        // становится ArrayBuffer и роняет отрисовку. См. utils/wire.js.
+        .then((data) => cb({ ok: true, ...toWire(data || {}) }))
         .catch((err) => {
             console.error(`[сокет:${label}]`, err.message);
             cb({ ok: false, error: err.message || 'Ошибка' });

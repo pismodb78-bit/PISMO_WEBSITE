@@ -143,3 +143,39 @@ test('профиль отдаёт «о себе» строкой, даже ес�
         assert.deepStrictEqual(findBuffers(p), [], 'в браузер не должно уйти ни одного буфера');
     });
 });
+
+// ── Ничто двоичное не уходит в браузер ─────────────────────────────────
+
+test('toWire вычищает буферы из ответа целиком', () => {
+    const { toWire } = require('../utils/wire');
+
+    const payload = {
+        messages: [
+            { id: 1, text: Buffer.from('привет', 'utf8'), sender: 'Аня' },
+            { id: 2, text: 'обычная строка', meta: { note: new Uint8Array(Buffer.from('заметка', 'utf8')) } },
+        ],
+        pinned: [],
+        count: 2,
+        nothing: null,
+    };
+
+    const wire = toWire(payload);
+
+    assert.strictEqual(wire.messages[0].text, 'привет');
+    assert.strictEqual(wire.messages[1].meta.note, 'заметка');
+    assert.strictEqual(wire.messages[1].text, 'обычная строка');
+    assert.strictEqual(wire.count, 2);
+    assert.strictEqual(wire.nothing, null);
+    assert.deepStrictEqual(findBuffers(wire), [], 'после toWire буферов быть не должно');
+});
+
+test('toWire не портит числа, логические значения и даты', () => {
+    const { toWire } = require('../utils/wire');
+    const when = new Date('2026-08-22T12:00:00Z');
+    const wire = toWire({ n: 42, ok: true, when, list: [1, 'два', false] });
+
+    assert.strictEqual(wire.n, 42);
+    assert.strictEqual(wire.ok, true);
+    assert.strictEqual(wire.when, when);
+    assert.deepStrictEqual(wire.list, [1, 'два', false]);
+});

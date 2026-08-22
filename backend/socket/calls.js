@@ -11,13 +11,16 @@
  * одно, звонок «идёт», но участники не видят друг друга.
  */
 const calls = require('../data/calls');
+const { toWire } = require('../utils/wire');
 const social = require('../data/social');
 const livekit = require('../utils/livekit');
 
 function reply(cb, promise, label) {
     if (typeof cb !== 'function') return promise.catch(() => {});
     return promise
-        .then((data) => cb({ ok: true, ...(data || {}) }))
+        // toWire: наружу не должен уйти ни один буфер — в браузере он
+        // становится ArrayBuffer и роняет отрисовку. См. utils/wire.js.
+        .then((data) => cb({ ok: true, ...toWire(data || {}) }))
         .catch((err) => {
             console.error(`[сокет:${label}]`, err.message);
             cb({ ok: false, error: err.message || 'Ошибка' });

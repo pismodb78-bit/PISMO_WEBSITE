@@ -35,10 +35,12 @@ if not exist "frontend\node_modules" (
     call npm --prefix frontend install --no-audit --no-fund || goto :fail
 )
 
-if not exist "frontend\dist\index.html" (
-    echo   Собираю сайт...
-    call npm --prefix frontend run build || goto :fail
-)
+rem Собираем ВСЕГДА, а не только когда сборки нет. frontend\dist лежит в
+rem .gitignore, поэтому git pull его не обновляет: после обновления кода на
+rem диске остаётся вчерашняя сборка, и сайт продолжает работать по-старому,
+rem как будто исправления не приехали.
+echo   Собираю сайт...
+call npm --prefix frontend run build || goto :fail
 
 echo.
 echo   Готово. Сайт: http://localhost:5000

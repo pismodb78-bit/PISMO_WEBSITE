@@ -23,6 +23,8 @@ const { socketAuth } = require('./utils/session');
 const presence = require('./data/presence');
 const livekit = require('./utils/livekit');
 
+const startedAt = Date.now();
+
 const app = express();
 const server = http.createServer(app);
 
@@ -62,7 +64,16 @@ app.get('/api/config', (_req, res) => {
 app.get('/api/health', async (_req, res) => {
     try {
         const version = await db.ping();
-        res.json({ status: 'ok', db: `${config.db.host}:${config.db.port}`, mysql: version });
+        const front = frontendState();
+        res.json({
+            status: 'ok',
+            db: `${config.db.host}:${config.db.port}`,
+            mysql: version,
+            startedAt: new Date(startedAt).toISOString(),
+            frontend: front.exists
+                ? { builtAt: new Date(front.builtAt).toISOString(), stale: front.stale }
+                : { builtAt: null, stale: false },
+        });
     } catch (err) {
         // База лежит — но сам сайт жив, и сказать об этом честнее, чем 500
         // без объяснений: ровно этот случай выглядел как «сайт не работает».
@@ -71,13 +82,102 @@ app.get('/api/health', async (_req, res) => {
 });
 
 // ── Собранный фронтенд ────────────────────────────────────────────────
+//
 // Если рядом лежит frontend/dist, отдаём его этим же процессом: на боевой
 // машине так не нужен отдельный веб-сервер и не возникает вопросов с CORS.
-const distDir = path.join(__dirname, '..', 'frontend', 'dist');
+//
+// ПРО УСТАРЕВШУЮ СБОРКУ. frontend/dist лежит в .gitignore, то есть
+// `git pull` его НЕ обновляет. Из-за этого получалась ловушка: человек
+// забирает исправления, перезапускает сервер — и продолжает видеть старый
+// сайт, потому что отдаётся вчерашняя сборка. Ошибка при этом выглядит как
+// «исправление не помогло», и искать её будут где угодно, только не здесь.
+// Поэтому сборку сверяем с исходниками и, если она отстала, говорим об
+// этом и в консоль, и прямо на странице.
+const frontDir = path.join(__dirname, '..', 'frontend');
+const distDir = path.join(frontDir, 'dist');
+const indexFile = path.join(distDir, 'index.html');
+
+/** Время последней правки среди исходников фронтенда. */
+function newestSourceTime(dir) {
+    let newest = 0;
+    const walk = (current) => {
+        let entries;
+        try {
+            entries = fs.readdirSync(current, { withFileTypes: true });
+        } catch (_) {
+            return;
+        }
+        for (const entry of entries) {
+            const full = path.join(current, entry.name);
+            if (entry.isDirectory()) {
+                if (entry.name === 'node_modules' || entry.name === 'dist') continue;
+                walk(full);
+            } else {
+                try {
+                    const t = fs.statSync(full).mtimeMs;
+                    if (t > newest) newest = t;
+                } catch (_) { /* файл исчез между чтениями — не важно */ }
+            }
+        }
+    };
+    walk(dir);
+    return newest;
+}
+
+/** Отстала ли сборка от исходников. */
+function frontendState() {
+    if (!fs.existsSync(indexFile)) return { exists: false, stale: false, builtAt: null };
+    const builtAt = fs.statSync(indexFile).mtimeMs;
+    const sources = Math.max(
+        newestSourceTime(path.join(frontDir, 'src')),
+        ...['index.html', 'vite.config.js', 'package.json'].map((f) => {
+            try { return fs.statSync(path.join(frontDir, f)).mtimeMs; } catch (_) { return 0; }
+        }),
+    );
+    return { exists: true, stale: sources > builtAt, builtAt, sources };
+}
+
+const STALE_BANNER = `
+<div id="pismo-stale" style="position:fixed;left:0;right:0;top:0;z-index:99999;
+     background:#ED4245;color:#fff;font:14px/1.4 'Segoe UI',system-ui,sans-serif;
+     padding:10px 16px;text-align:center">
+  Открыта <b>устаревшая сборка</b> сайта: исходники новее.
+  Выполните <code style="background:rgba(0,0,0,.25);padding:1px 5px;border-radius:3px">npm run build</code>
+  в папке <b>frontend</b> и обновите страницу.
+</div>`;
+
 if (fs.existsSync(distDir)) {
-    app.use(express.static(distDir));
-    app.get(/^(?!\/api\/).*/, (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
+    // index: false — index.html отдаём сами, чтобы при устаревшей сборке
+    // дописать в него предупреждение.
+    app.use(express.static(distDir, { index: false }));
+
+    app.get(/^(?!\/api\/).*/, (_req, res) => {
+        const state = frontendState();
+        if (!state.stale) return res.sendFile(indexFile);
+        try {
+            const html = fs.readFileSync(indexFile, 'utf8');
+            res.type('html');
+            return res.send(html.replace('<body>', `<body>${STALE_BANNER}`));
+        } catch (_) {
+            return res.sendFile(indexFile);
+        }
+    });
+
+    const state = frontendState();
     console.log(`[веб] отдаём собранный фронтенд из ${distDir}`);
+    if (state.stale) {
+        console.warn('');
+        console.warn('  ВНИМАНИЕ: сборка фронтенда устарела — исходники новее.');
+        console.warn(`  Собрана: ${new Date(state.builtAt).toLocaleString('ru-RU')}`);
+        console.warn(`  Правки:  ${new Date(state.sources).toLocaleString('ru-RU')}`);
+        console.warn('  Выполните: npm --prefix frontend run build');
+        console.warn('');
+    }
+} else {
+    console.warn('');
+    console.warn(`  Сборки фронтенда нет (${distDir}).`);
+    console.warn('  Сайт отдаваться не будет. Выполните: npm --prefix frontend run build');
+    console.warn('');
 }
 
 // ── Сокеты ────────────────────────────────────────────────────────────
