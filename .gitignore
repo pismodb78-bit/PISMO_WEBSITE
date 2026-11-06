@@ -1,3 +1,7 @@
 .vs/
 
 node_modules/
+
+# Сборка фронтенда и локальные настройки
+frontend/dist/
+.env

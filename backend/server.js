@@ -1,3 +1,17 @@
+// Настройки из backend/.env (если файл есть) — до всех require: модули ниже
+// читают process.env прямо при загрузке. Уже заданные переменные (например,
+// из systemd на VPS) не перетираются. Без зависимостей: формат KEY=VALUE.
+(() => {
+    const fs = require('fs');
+    const file = require('path').join(__dirname, '.env');
+    if (!fs.existsSync(file)) return;
+    for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+        const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+        if (!m || process.env[m[1]] !== undefined) continue;
+        process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+    }
+})();
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -51,8 +65,10 @@ io.on('connection', (socket) => {
 global.io = io;
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
+// На VPS бэкенд закрыт за nginx: HOST=127.0.0.1, снаружи его не видно.
+const HOST = process.env.HOST || '0.0.0.0';
+server.listen(PORT, HOST, () => {
     console.log(`==================================================`);
-    console.log(`🚀 Сервер PISMO Web (WebSocket-only) запущен на порту ${PORT}`);
+    console.log(`🚀 Сервер PISMO Web (WebSocket-only) запущен на ${HOST}:${PORT}`);
     console.log(`==================================================`);
 });
